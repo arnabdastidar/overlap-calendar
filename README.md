@@ -10,8 +10,8 @@ Overlap is a privacy-first group availability portal for Google Calendar and Mic
 
 ## What it does
 
-- Creates private groups without app accounts or email login
-- Uses a group name and password for members
+- Creates private groups without global app accounts
+- Uses a group name, password, and one-time email code for members
 - Gives the creator a separate recovery key and settings access
 - Connects Google Calendar and Microsoft Outlook with read-only calendar scopes
 - Supports direct, self-service OAuth for Google Calendar and Microsoft Outlook
@@ -21,9 +21,9 @@ Overlap is a privacy-first group availability portal for Google Calendar and Mic
 
 ## Product flow
 
-1. A creator chooses a globally unique group name, password, and display name.
+1. A creator chooses a globally unique group name, password, display name, and verifies their email.
 2. Overlap returns a one-time creator recovery key.
-3. Members open the shared link and enter the group password plus a display name.
+3. Members open the shared link, enter the group password, and verify their email with a six-digit code.
 4. Each person privately authorizes Google, Microsoft, or an administrator-provisioned Calendar MCP account. One participant can connect both Google and Microsoft calendars.
 5. The availability board intersects busy blocks and shows the times everyone shares.
 
@@ -55,6 +55,19 @@ npm run lint
 npm run build
 npm run db:generate
 ```
+
+## Email identity and profile recovery
+
+Email verification prevents someone who only has a shared link and password from viewing group availability. Within a group, the normalized verified email is unique. Returning with the same email reopens the existing participant and preserves their calendar connections instead of creating a duplicate person.
+
+Overlap uses Resend for transactional verification codes. Each self-hosted deployment supplies its own sending key and verified sender; credentials are never committed to the repository:
+
+```dotenv
+RESEND_API_KEY=
+EMAIL_FROM="Overlap <verify@YOUR_HOST>"
+```
+
+Codes expire after ten minutes, are stored only as hashes, allow at most five attempts, and are rate-limited per email address. Existing deployments can let legacy participants verify the profile they already use, including on the original deployment URL, before reopening it on a custom domain.
 
 ## How calendar connections work in an open-source deployment
 
@@ -161,7 +174,8 @@ The web app is React 19 on Vinext and Cloudflare Workers. D1 stores groups, pass
 
 ## Privacy and security choices
 
-- App access is separate from calendar-provider identity; there is no Overlap user account.
+- App access uses a verified email within each group; there is no global Overlap user account.
+- Email verification codes are short-lived, rate-limited, and stored only as hashes.
 - Group passwords are never stored or returned in plaintext.
 - Creator recovery keys are returned once and stored only as SHA-256 hashes.
 - Session and OAuth state values are stored as hashes.
@@ -182,6 +196,7 @@ Before inviting a group, verify all of the following:
 - At least one direct OAuth provider reports as configured in the connection dialog.
 - The registered OAuth callback exactly matches the deployed HTTPS origin.
 - `TOKEN_ENCRYPTION_KEY` is set as a secret and is stable across deployments.
+- `RESEND_API_KEY` and a verified `EMAIL_FROM` sender are configured.
 - `ENABLE_DEMO_CALENDARS` is absent or `false`.
 - A full create → join → provider consent → availability flow has been tested with two separate browser sessions.
 

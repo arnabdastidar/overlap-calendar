@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import { hashPassword, randomToken, sha256, verifyPassword } from "./crypto";
+import { sendVerificationEmail } from "./email";
 
 export type Provider = "google" | "microsoft" | "mcp";
 
@@ -13,6 +14,7 @@ type AppEnv = {
   CALENDAR_MCP_URL?: string;
   CALENDAR_MCP_API_KEY?: string;
   ENABLE_DEMO_CALENDARS?: string;
+  MAINTENANCE_TOKEN?: string;
 };
 
 export const appEnv = env as unknown as AppEnv;
@@ -28,6 +30,8 @@ type GroupContext = {
   groupName: string;
   slug: string;
   displayName: string;
+  email: string | null;
+  emailVerified: boolean;
 };
 
 function db() {
@@ -35,10 +39,9 @@ function db() {
   return appEnv.DB;
 }
 
-export function ensureDatabase() {
-  if (!setupPromise) {
-    const database = db();
-    setupPromise = database.batch([
+async function initializeDatabase() {
+  const database = db();
+  await database.batch([
       database.prepare(`CREATE TABLE IF NOT EXISTS groups (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT NOT NULL UNIQUE,
         slug TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, password_salt TEXT NOT NULL,
@@ -46,7 +49,8 @@ export function ensureDatabase() {
       )`),
       database.prepare(`CREATE TABLE IF NOT EXISTS participants (
         id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
-        display_name TEXT NOT NULL, color TEXT NOT NULL, created_at INTEGER NOT NULL
+        display_name TEXT NOT NULL, color TEXT NOT NULL, email TEXT, email_key TEXT,
+        email_verified_at INTEGER, is_creator INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
       )`),
       database.prepare(`CREATE TABLE IF NOT EXISTS sessions (
         token_hash TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
@@ -64,10 +68,46 @@ export function ensureDatabase() {
         participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
         provider TEXT NOT NULL, redirect_uri TEXT NOT NULL, expires_at INTEGER NOT NULL
       )`),
+      database.prepare(`CREATE TABLE IF NOT EXISTS email_verifications (
+        challenge_hash TEXT PRIMARY KEY,
+        group_id TEXT REFERENCES groups(id) ON DELETE CASCADE,
+        participant_id TEXT REFERENCES participants(id) ON DELETE CASCADE,
+        email_key TEXT NOT NULL, purpose TEXT NOT NULL, code_hash TEXT NOT NULL,
+        expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
+      )`),
       database.prepare("CREATE INDEX IF NOT EXISTS idx_participants_group_id ON participants(group_id)"),
       database.prepare("CREATE INDEX IF NOT EXISTS idx_sessions_group_id ON sessions(group_id)"),
       database.prepare("CREATE INDEX IF NOT EXISTS idx_connections_participant_id ON calendar_connections(participant_id)"),
-    ]).then(() => undefined).catch((error) => {
+      database.prepare("CREATE INDEX IF NOT EXISTS idx_email_verifications_email_created ON email_verifications(email_key, created_at)"),
+    ]);
+
+  const info = await database.prepare("PRAGMA table_info(participants)").all<Record<string, unknown>>();
+  const columns = new Set(info.results.map((column) => String(column.name)));
+  const additions: D1PreparedStatement[] = [];
+  if (!columns.has("email")) additions.push(database.prepare("ALTER TABLE participants ADD COLUMN email TEXT"));
+  if (!columns.has("email_key")) additions.push(database.prepare("ALTER TABLE participants ADD COLUMN email_key TEXT"));
+  if (!columns.has("email_verified_at")) additions.push(database.prepare("ALTER TABLE participants ADD COLUMN email_verified_at INTEGER"));
+  if (!columns.has("is_creator")) additions.push(database.prepare("ALTER TABLE participants ADD COLUMN is_creator INTEGER NOT NULL DEFAULT 0"));
+  if (additions.length) await database.batch(additions);
+
+  await database.batch([
+    database.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_group_email ON participants(group_id, email_key) WHERE email_key IS NOT NULL"),
+    database.prepare(`UPDATE participants SET is_creator = 1
+      WHERE id IN (
+        SELECT candidate.id FROM participants candidate
+        WHERE candidate.id = (
+          SELECT first_participant.id FROM participants first_participant
+          WHERE first_participant.group_id = candidate.group_id
+          ORDER BY first_participant.created_at ASC, first_participant.id ASC LIMIT 1
+        )
+      ) AND group_id NOT IN (SELECT group_id FROM participants WHERE is_creator = 1)`),
+    database.prepare("PRAGMA optimize"),
+  ]);
+}
+
+export function ensureDatabase() {
+  if (!setupPromise) {
+    setupPromise = initializeDatabase().catch((error) => {
       setupPromise = null;
       throw error;
     });
@@ -79,6 +119,12 @@ function cleanName(value: string, label: string, max = 60) {
   const result = value.trim().replace(/\s+/g, " ");
   if (result.length < 2 || result.length > max) throw new Error(`${label} must be between 2 and ${max} characters.`);
   return result;
+}
+
+function cleanEmail(value: string) {
+  const email = value.trim().toLowerCase();
+  if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error("Enter a valid email address.");
+  return email;
 }
 
 function slugify(value: string) {
@@ -126,11 +172,124 @@ async function makeSession(groupId: string, participantId: string, role: "admin"
   return token;
 }
 
-export async function createGroup(input: { name: string; password: string; displayName: string }) {
+type VerificationPurpose = "create" | "join" | "creator" | "profile";
+
+async function findGroup(value: string) {
+  const groupLookup = cleanName(value, "Group name").toLowerCase();
+  return db().prepare("SELECT * FROM groups WHERE name_key = ? OR slug = ? LIMIT 1")
+    .bind(groupLookup, groupLookup).first<Record<string, unknown>>();
+}
+
+async function verifiedGroup(value: string, password: string) {
+  const group = await findGroup(value);
+  if (!group || !(await verifyPassword(password, String(group.password_salt), String(group.password_hash)))) {
+    throw new Error("Group name or password is incorrect.");
+  }
+  return group;
+}
+
+function sixDigitCode() {
+  const random = new Uint32Array(1);
+  crypto.getRandomValues(random);
+  return String(100000 + (random[0] % 900000));
+}
+
+export async function requestEmailVerification(request: Request, input: {
+  purpose: VerificationPurpose;
+  email: string;
+  group?: string;
+  password?: string;
+}) {
+  await ensureDatabase();
+  const email = cleanEmail(input.email);
+  let group: Record<string, unknown> | null = null;
+  let participantId: string | null = null;
+
+  if (input.purpose === "create") {
+    const name = cleanName(input.group ?? "", "Group name");
+    const slug = slugify(name);
+    const existing = await db().prepare("SELECT id FROM groups WHERE name_key = ? OR slug = ? LIMIT 1")
+      .bind(name.toLowerCase(), slug).first();
+    if (existing) throw new Error("That group name is already in use. Try a more specific name.");
+  } else if (input.purpose === "join") {
+    group = await verifiedGroup(input.group ?? "", input.password ?? "");
+  } else if (input.purpose === "creator") {
+    group = await findGroup(input.group ?? "");
+    const creator = group ? await db().prepare(`SELECT id FROM participants
+      WHERE group_id = ? AND is_creator = 1 AND email_key = ? LIMIT 1`)
+      .bind(group.id, email).first<Record<string, unknown>>() : null;
+    if (!group || !creator) {
+      return { challenge: randomToken(24), expiresIn: 600 };
+    }
+    participantId = String(creator.id);
+  } else {
+    const context = await currentContext(request);
+    if (!context) throw new Error("Join a group before verifying this profile.");
+    group = await db().prepare("SELECT * FROM groups WHERE id = ? LIMIT 1").bind(context.groupId).first<Record<string, unknown>>();
+    participantId = context.participantId;
+  }
+
+  await db().prepare("DELETE FROM email_verifications WHERE expires_at < ?").bind(Date.now()).run();
+  const recent = await db().prepare(`SELECT COUNT(*) AS count FROM email_verifications
+    WHERE email_key = ? AND created_at > ?`).bind(email, Date.now() - 10 * 60 * 1000).first<Record<string, unknown>>();
+  if (Number(recent?.count ?? 0) >= 3) throw new Error("Too many codes were requested. Please wait 10 minutes and try again.");
+
+  const challenge = randomToken(24);
+  const challengeHash = await sha256(challenge);
+  const code = sixDigitCode();
+  const now = Date.now();
+  await db().prepare(`INSERT INTO email_verifications
+    (challenge_hash, group_id, participant_id, email_key, purpose, code_hash, expires_at, attempts, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`)
+    .bind(challengeHash, group?.id ?? null, participantId, email, input.purpose, await sha256(`${challenge}:${code}`), now + 10 * 60 * 1000, now).run();
+  try {
+    const sent = await sendVerificationEmail({
+      email, code, groupName: group ? String(group.name) : input.group?.trim(), idempotencyKey: challengeHash,
+    });
+    return { challenge, expiresIn: 600, ...sent };
+  } catch (error) {
+    await db().prepare("DELETE FROM email_verifications WHERE challenge_hash = ?").bind(challengeHash).run();
+    throw error;
+  }
+}
+
+async function consumeEmailVerification(input: {
+  purpose: VerificationPurpose;
+  email: string;
+  challenge: string;
+  code: string;
+  groupId?: string | null;
+  participantId?: string | null;
+}) {
+  const email = cleanEmail(input.email);
+  const challengeHash = await sha256(input.challenge);
+  const verification = await db().prepare("SELECT * FROM email_verifications WHERE challenge_hash = ? LIMIT 1")
+    .bind(challengeHash).first<Record<string, unknown>>();
+  if (!verification || String(verification.purpose) !== input.purpose || String(verification.email_key) !== email
+    || (input.groupId !== undefined && String(verification.group_id ?? "") !== String(input.groupId ?? ""))
+    || (input.participantId !== undefined && String(verification.participant_id ?? "") !== String(input.participantId ?? ""))) {
+    throw new Error("That verification code is invalid or has expired.");
+  }
+  if (Number(verification.expires_at) < Date.now() || Number(verification.attempts) >= 5) {
+    await db().prepare("DELETE FROM email_verifications WHERE challenge_hash = ?").bind(challengeHash).run();
+    throw new Error("That verification code is invalid or has expired.");
+  }
+  const expected = String(verification.code_hash);
+  const supplied = await sha256(`${input.challenge}:${input.code.trim()}`);
+  if (supplied !== expected) {
+    await db().prepare("UPDATE email_verifications SET attempts = attempts + 1 WHERE challenge_hash = ?").bind(challengeHash).run();
+    throw new Error("That verification code is incorrect.");
+  }
+  await db().prepare("DELETE FROM email_verifications WHERE challenge_hash = ?").bind(challengeHash).run();
+  return email;
+}
+
+export async function createGroup(input: { name: string; password: string; displayName: string; email: string; challenge: string; code: string }) {
   await ensureDatabase();
   const name = cleanName(input.name, "Group name");
   const displayName = cleanName(input.displayName, "Your name", 40);
   if (input.password.length < 6 || input.password.length > 100) throw new Error("Password must be between 6 and 100 characters.");
+  const email = await consumeEmailVerification({ purpose: "create", email: input.email, challenge: input.challenge, code: input.code });
 
   const groupId = crypto.randomUUID();
   const participantId = crypto.randomUUID();
@@ -146,8 +305,9 @@ export async function createGroup(input: { name: string; password: string; displ
         (id, name, name_key, slug, password_hash, password_salt, admin_token_hash, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .bind(groupId, name, name.toLowerCase(), slug, hash, salt, await sha256(adminKey), now, now),
-      db().prepare("INSERT INTO participants (id, group_id, display_name, color, created_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(participantId, groupId, displayName, colorFor(participantId), now),
+      db().prepare(`INSERT INTO participants
+        (id, group_id, display_name, color, email, email_key, email_verified_at, is_creator, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)`).bind(participantId, groupId, displayName, colorFor(participantId), email, email, now, now),
     ]);
   } catch (error) {
     if (String(error).toLowerCase().includes("unique")) throw new Error("That group name is already in use. Try a more specific name.");
@@ -156,33 +316,54 @@ export async function createGroup(input: { name: string; password: string; displ
   return { token: await makeSession(groupId, participantId, "admin"), adminKey, slug };
 }
 
-export async function joinGroup(input: { group: string; password: string; displayName: string }) {
+export async function joinGroup(input: { group: string; password: string; displayName: string; email: string; challenge: string; code: string }) {
   await ensureDatabase();
-  const groupLookup = cleanName(input.group, "Group name").toLowerCase();
   const displayName = cleanName(input.displayName, "Your name", 40);
-  const group = await db().prepare("SELECT * FROM groups WHERE name_key = ? OR slug = ? LIMIT 1").bind(groupLookup, groupLookup).first<Record<string, unknown>>();
-  if (!group || !(await verifyPassword(input.password, String(group.password_salt), String(group.password_hash)))) {
-    throw new Error("Group name or password is incorrect.");
+  const group = await verifiedGroup(input.group, input.password);
+  const email = await consumeEmailVerification({ purpose: "join", email: input.email, challenge: input.challenge, code: input.code, groupId: String(group.id) });
+  const existing = await db().prepare("SELECT id, is_creator FROM participants WHERE group_id = ? AND email_key = ? LIMIT 1")
+    .bind(group.id, email).first<Record<string, unknown>>();
+  const participantId = existing ? String(existing.id) : crypto.randomUUID();
+  const now = Date.now();
+  if (existing) {
+    await db().prepare("UPDATE participants SET display_name = ?, email = ?, email_verified_at = ? WHERE id = ?")
+      .bind(displayName, email, now, participantId).run();
+  } else {
+    await db().prepare(`INSERT INTO participants
+      (id, group_id, display_name, color, email, email_key, email_verified_at, is_creator, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)`).bind(participantId, group.id, displayName, colorFor(participantId), email, email, now, now).run();
   }
-  const participantId = crypto.randomUUID();
-  await db().prepare("INSERT INTO participants (id, group_id, display_name, color, created_at) VALUES (?, ?, ?, ?, ?)")
-    .bind(participantId, group.id, displayName, colorFor(participantId), Date.now()).run();
-  return { token: await makeSession(String(group.id), participantId, "member"), slug: String(group.slug) };
+  const role = Number(existing?.is_creator ?? 0) === 1 ? "admin" : "member";
+  return { token: await makeSession(String(group.id), participantId, role), slug: String(group.slug) };
 }
 
 export async function recoverGroup(input: { group: string; adminKey: string; displayName: string }) {
   await ensureDatabase();
-  const groupLookup = cleanName(input.group, "Group name").toLowerCase();
   const displayName = cleanName(input.displayName, "Your name", 40);
-  const group = await db().prepare("SELECT * FROM groups WHERE name_key = ? OR slug = ? LIMIT 1").bind(groupLookup, groupLookup).first<Record<string, unknown>>();
+  const group = await findGroup(input.group);
   const suppliedHash = await sha256(input.adminKey.trim());
   if (!group || suppliedHash !== String(group.admin_token_hash)) throw new Error("Group name or creator recovery key is incorrect.");
-  const creator = await db().prepare("SELECT id FROM participants WHERE group_id = ? ORDER BY created_at ASC, id ASC LIMIT 1")
+  const creator = await db().prepare("SELECT id FROM participants WHERE group_id = ? AND is_creator = 1 ORDER BY created_at ASC, id ASC LIMIT 1")
     .bind(group.id).first<Record<string, unknown>>();
   if (!creator) throw new Error("The creator profile for this group is missing.");
   const participantId = String(creator.id);
   await db().prepare("UPDATE participants SET display_name = ? WHERE id = ? AND group_id = ?")
     .bind(displayName, participantId, group.id).run();
+  return { token: await makeSession(String(group.id), participantId, "admin"), slug: String(group.slug) };
+}
+
+export async function recoverGroupByEmail(input: { group: string; displayName: string; email: string; challenge: string; code: string }) {
+  await ensureDatabase();
+  const group = await findGroup(input.group);
+  if (!group) throw new Error("That verification code is invalid or has expired.");
+  const displayName = cleanName(input.displayName, "Your name", 40);
+  const email = await consumeEmailVerification({ purpose: "creator", email: input.email, challenge: input.challenge, code: input.code, groupId: String(group.id) });
+  const creator = await db().prepare("SELECT id FROM participants WHERE group_id = ? AND is_creator = 1 AND email_key = ? LIMIT 1")
+    .bind(group.id, email).first<Record<string, unknown>>();
+  if (!creator) throw new Error("That verification code is invalid or has expired.");
+  const participantId = String(creator.id);
+  await db().prepare("UPDATE participants SET display_name = ?, email = ?, email_verified_at = ? WHERE id = ?")
+    .bind(displayName, email, Date.now(), participantId).run();
   return { token: await makeSession(String(group.id), participantId, "admin"), slug: String(group.slug) };
 }
 
@@ -194,9 +375,10 @@ function requestedGroup(request: Request) {
 
 async function sessionContexts(request: Request) {
   await ensureDatabase();
-  const rows = await Promise.all(sessionTokens(request).map(async (token) => db().prepare(`SELECT
+      const rows = await Promise.all(sessionTokens(request).map(async (token) => db().prepare(`SELECT
         s.group_id AS groupId, s.participant_id AS participantId, s.role, s.expires_at AS expiresAt,
-        g.name AS groupName, g.slug, p.display_name AS displayName
+        g.name AS groupName, g.slug, p.display_name AS displayName, p.email,
+        p.email_verified_at AS emailVerifiedAt, p.is_creator AS isCreator
       FROM sessions s JOIN groups g ON g.id = s.group_id JOIN participants p ON p.id = s.participant_id
       WHERE s.token_hash = ? LIMIT 1`)
     .bind(await sha256(token)).first<Record<string, unknown>>()));
@@ -205,8 +387,9 @@ async function sessionContexts(request: Request) {
     if (!row || Number(row.expiresAt) < Date.now()) return;
     const context: GroupContext = {
       groupId: String(row.groupId), participantId: String(row.participantId),
-      role: row.role === "admin" ? "admin" : "member",
+      role: row.role === "admin" || Number(row.isCreator) === 1 ? "admin" : "member",
       groupName: String(row.groupName), slug: String(row.slug), displayName: String(row.displayName),
+      email: row.email ? String(row.email) : null, emailVerified: Number(row.emailVerifiedAt ?? 0) > 0,
     };
     const existing = contexts.get(context.slug);
     if (!existing || context.role === "admin") contexts.set(context.slug, context);
@@ -226,6 +409,7 @@ export async function groupSnapshot(request: Request) {
   const context = (requested ? contexts.find((item) => item.slug === requested) : null) ?? contexts.at(-1) ?? null;
   if (!context) return null;
   const members = await db().prepare(`SELECT p.id, p.display_name AS displayName, p.color,
+      p.email_verified_at AS emailVerifiedAt, p.is_creator AS isCreator,
       c.provider, c.display_name AS calendarName, c.account_ref AS accountRef
     FROM participants p LEFT JOIN calendar_connections c ON c.participant_id = p.id
     WHERE p.group_id = ? ORDER BY p.created_at ASC`)
@@ -234,6 +418,7 @@ export async function groupSnapshot(request: Request) {
     groupName: item.groupName, slug: item.slug, role: item.role, participantId: item.participantId,
   })), members: members.results.map((member) => ({
     id: String(member.id), displayName: String(member.displayName), color: String(member.color),
+    emailVerified: Number(member.emailVerifiedAt ?? 0) > 0, isCreator: Number(member.isCreator ?? 0) === 1,
     provider: member.provider ? String(member.provider) : null,
     calendarName: member.calendarName ? String(member.calendarName) : null,
     isDemo: (member.provider === "google" || member.provider === "microsoft")
@@ -279,15 +464,91 @@ export async function removeGroupMember(request: Request, participantId: string)
   const context = await currentContext(request);
   if (!context || context.role !== "admin") throw new Error("Only the group creator can remove people.");
   if (participantId === context.participantId) throw new Error("You cannot remove yourself from a group you created.");
-  const participant = await db().prepare("SELECT id FROM participants WHERE id = ? AND group_id = ? LIMIT 1")
+  const participant = await db().prepare("SELECT id, is_creator FROM participants WHERE id = ? AND group_id = ? LIMIT 1")
     .bind(participantId, context.groupId).first<Record<string, unknown>>();
   if (!participant) throw new Error("That person is no longer in this group.");
+  if (Number(participant.is_creator) === 1) throw new Error("The creator profile cannot be removed.");
   await db().batch([
     db().prepare("DELETE FROM oauth_states WHERE participant_id = ?").bind(participantId),
     db().prepare("DELETE FROM calendar_connections WHERE participant_id = ?").bind(participantId),
     db().prepare("DELETE FROM sessions WHERE participant_id = ?").bind(participantId),
     db().prepare("DELETE FROM participants WHERE id = ? AND group_id = ?").bind(participantId, context.groupId),
   ]);
+}
+
+async function mergeParticipantInto(groupId: string, sourceId: string, targetId: string) {
+  if (sourceId === targetId) return;
+  const people = await db().prepare("SELECT id, is_creator FROM participants WHERE group_id = ? AND id IN (?, ?)")
+    .bind(groupId, sourceId, targetId).all<Record<string, unknown>>();
+  if (people.results.length !== 2) throw new Error("One of the profiles to merge no longer exists.");
+  const source = people.results.find((person) => String(person.id) === sourceId);
+  const target = people.results.find((person) => String(person.id) === targetId);
+  const isCreator = Number(source?.is_creator ?? 0) === 1 || Number(target?.is_creator ?? 0) === 1;
+  const sourceConnections = await db().prepare("SELECT id, provider FROM calendar_connections WHERE participant_id = ?")
+    .bind(sourceId).all<Record<string, unknown>>();
+  for (const connection of sourceConnections.results) {
+    const existing = await db().prepare("SELECT id FROM calendar_connections WHERE participant_id = ? AND provider = ? LIMIT 1")
+      .bind(targetId, connection.provider).first<Record<string, unknown>>();
+    if (existing) {
+      await db().prepare("DELETE FROM calendar_connections WHERE id = ?").bind(connection.id).run();
+    } else {
+      await db().prepare("UPDATE calendar_connections SET participant_id = ? WHERE id = ?").bind(targetId, connection.id).run();
+    }
+  }
+  await db().batch([
+    db().prepare("UPDATE oauth_states SET participant_id = ? WHERE participant_id = ?").bind(targetId, sourceId),
+    db().prepare("UPDATE sessions SET participant_id = ?, role = ? WHERE participant_id = ?").bind(targetId, isCreator ? "admin" : "member", sourceId),
+    db().prepare("UPDATE participants SET is_creator = ? WHERE id = ?").bind(isCreator ? 1 : 0, targetId),
+    db().prepare("DELETE FROM participants WHERE id = ? AND group_id = ?").bind(sourceId, groupId),
+  ]);
+  if (isCreator) await db().prepare("UPDATE sessions SET role = 'admin' WHERE participant_id = ?").bind(targetId).run();
+}
+
+export async function verifyCurrentProfileEmail(request: Request, input: { email: string; challenge: string; code: string }) {
+  const context = await currentContext(request);
+  if (!context) throw new Error("Join a group before verifying this profile.");
+  const email = await consumeEmailVerification({
+    purpose: "profile", email: input.email, challenge: input.challenge, code: input.code,
+    groupId: context.groupId, participantId: context.participantId,
+  });
+  const existing = await db().prepare("SELECT id FROM participants WHERE group_id = ? AND email_key = ? LIMIT 1")
+    .bind(context.groupId, email).first<Record<string, unknown>>();
+  const now = Date.now();
+  if (existing && String(existing.id) !== context.participantId) {
+    await db().prepare("UPDATE participants SET email = ?, email_key = ?, email_verified_at = ? WHERE id = ?")
+      .bind(email, email, now, existing.id).run();
+    await mergeParticipantInto(context.groupId, context.participantId, String(existing.id));
+    return { merged: true };
+  }
+  await db().prepare("UPDATE participants SET email = ?, email_key = ?, email_verified_at = ? WHERE id = ? AND group_id = ?")
+    .bind(email, email, now, context.participantId, context.groupId).run();
+  return { merged: false };
+}
+
+export async function maintainLegacyCreator(request: Request, input: { group: string; email: string; mergeDisplayName?: string }) {
+  await ensureDatabase();
+  const authorization = request.headers.get("authorization") ?? "";
+  if (!appEnv.MAINTENANCE_TOKEN || authorization !== `Bearer ${appEnv.MAINTENANCE_TOKEN}`) throw new Error("Maintenance access denied.");
+  const group = await findGroup(input.group);
+  if (!group) throw new Error("Group not found.");
+  const creator = await db().prepare("SELECT id FROM participants WHERE group_id = ? AND is_creator = 1 ORDER BY created_at ASC, id ASC LIMIT 1")
+    .bind(group.id).first<Record<string, unknown>>();
+  if (!creator) throw new Error("Creator profile not found.");
+  const email = cleanEmail(input.email);
+  await db().prepare("UPDATE participants SET email = ?, email_key = ?, is_creator = 1 WHERE id = ?")
+    .bind(email, email, creator.id).run();
+  let merged = 0;
+  if (input.mergeDisplayName?.trim()) {
+    const duplicates = await db().prepare(`SELECT id FROM participants
+      WHERE group_id = ? AND id != ? AND lower(display_name) = lower(?) ORDER BY created_at ASC`)
+      .bind(group.id, creator.id, input.mergeDisplayName.trim()).all<Record<string, unknown>>();
+    for (const duplicate of duplicates.results) {
+      await mergeParticipantInto(String(group.id), String(duplicate.id), String(creator.id));
+      merged += 1;
+    }
+  }
+  await db().prepare("UPDATE sessions SET role = 'admin' WHERE participant_id = ?").bind(creator.id).run();
+  return { slug: String(group.slug), creatorParticipantId: String(creator.id), merged };
 }
 
 export async function leaveGroup(request: Request) {

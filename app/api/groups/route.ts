@@ -15,8 +15,11 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
-    const body = await request.json() as { name?: string; password?: string; displayName?: string };
-    const result = await createGroup({ name: body.name ?? "", password: body.password ?? "", displayName: body.displayName ?? "" });
+    const body = await request.json() as { name?: string; password?: string; displayName?: string; email?: string; challenge?: string; code?: string };
+    const result = await createGroup({
+      name: body.name ?? "", password: body.password ?? "", displayName: body.displayName ?? "",
+      email: body.email ?? "", challenge: body.challenge ?? "", code: body.code ?? "",
+    });
     return new Response(JSON.stringify({ slug: result.slug, adminKey: result.adminKey }), {
       status: 201,
       headers: { "content-type": "application/json", "set-cookie": sessionCookie(request, result.token) },

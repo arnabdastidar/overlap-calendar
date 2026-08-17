@@ -2,15 +2,15 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
-type Member = { id: string; displayName: string; color: string; provider: string | null; calendarName: string | null; isDemo: boolean };
+type Member = { id: string; displayName: string; color: string; provider: string | null; calendarName: string | null; isDemo: boolean; emailVerified: boolean; isCreator: boolean };
 type GroupAccess = { groupName: string; slug: string; role: "admin" | "member"; participantId: string };
 type Group = {
   groupName: string; slug: string; displayName: string; role: "admin" | "member";
-  participantId: string; members: Member[]; accessibleGroups: GroupAccess[];
+  participantId: string; email: string | null; emailVerified: boolean; members: Member[]; accessibleGroups: GroupAccess[];
 };
 type Slot = { start: string; end: string };
 type CalendarConfig = { google: boolean; microsoft: boolean; mcp: boolean; demo: boolean };
-type Modal = "create" | "join" | "recover" | "creatorKey" | "switch" | "connect" | "share" | "settings" | "people" | null;
+type Modal = "create" | "join" | "recover" | "creatorKey" | "switch" | "connect" | "share" | "settings" | "people" | "verifyEmail" | null;
 
 const durations = Array.from({ length: 10 }, (_, index) => (index + 1) * 30);
 
@@ -180,6 +180,35 @@ export default function Home() {
     }
   }
 
+  async function requestGroupCode(data: Record<string, FormDataEntryValue>, mode: "create" | "join" | "recover") {
+    setFormError("");
+    try {
+      const result = await jsonRequest("/api/email-verification", "POST", {
+        purpose: mode === "recover" ? "creator" : mode,
+        email: data.email, group: mode === "create" ? data.name : data.group, password: data.password,
+      });
+      showToast("Verification code sent");
+      return result as { challenge: string; debugCode?: string };
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : "Could not send a verification code.");
+      throw error;
+    }
+  }
+
+  async function verifyProfileEmail(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setFormError("");
+    try {
+      const data = Object.fromEntries(new FormData(event.currentTarget));
+      await jsonRequest("/api/profile/email", "PATCH", data);
+      setModal(null);
+      await loadGroup(group?.slug);
+      showToast("Email verified — this profile can now be recovered");
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : "Could not verify this profile.");
+    }
+  }
+
   async function connect(provider: "google" | "microsoft") {
     setFormError("");
     try {
@@ -282,7 +311,7 @@ export default function Home() {
               <button className="primary-cta" onClick={() => setModal("create")}>Create a group <span>→</span></button>
               <button className="text-cta" onClick={() => setModal("join")}>Join a group</button>
             </div>
-            <div className="privacy-line"><span>✓</span> No accounts or email login <i>·</i> Free/busy only <i>·</i> MIT licensed</div>
+            <div className="privacy-line"><span>✓</span> Verified email, no account <i>·</i> Free/busy only <i>·</i> MIT licensed</div>
           </div>
           <div className="hero-demo">
             <div className="demo-window">
@@ -298,7 +327,7 @@ export default function Home() {
           </div>
         </section>
         <section className="how-strip"><span>01</span><p><strong>Create a private group</strong><small>Choose a name and password.</small></p><i>→</i><span>02</span><p><strong>Everyone connects</strong><small>Google or Microsoft calendars.</small></p><i>→</i><span>03</span><p><strong>Pick the overlap</strong><small>From 30 minutes to 5 hours.</small></p></section>
-        {modal && ["create", "join", "recover"].includes(modal) && <AuthModal mode={modal as "create" | "join" | "recover"} sharedGroup={shared} error={formError} onClose={() => { setModal(null); setFormError(""); }} onSubmit={submitGroup} onMode={setModal} />}
+        {modal && ["create", "join", "recover"].includes(modal) && <AuthModal mode={modal as "create" | "join" | "recover"} sharedGroup={shared} error={formError} onClose={() => { setModal(null); setFormError(""); }} onSubmit={submitGroup} onRequestCode={requestGroupCode} onMode={setModal} />}
         {toast && <div className="toast">{toast}</div>}
       </main>
     );
@@ -331,6 +360,8 @@ export default function Home() {
             <button className="share-button" onClick={() => setModal("share")}><span>↗</span> Share group</button>
           </div>
         </header>
+
+        {!group.emailVerified && <div className="verification-banner"><div><strong>Protect this calendar profile</strong><span>Verify your email to reopen this same person and their calendars on another device or domain.</span></div><button type="button" onClick={() => setModal("verifyEmail")}>Verify email</button></div>}
 
         <div className="member-strip">
           <div className="avatars" aria-label={`${uniqueMembers.length} group members`}>
@@ -384,9 +415,20 @@ export default function Home() {
       {modal === "share" && <ShareModal group={group} shareUrl={shareUrl} recoveryKey={recoveryKey} onCopy={copy} onClose={() => setModal(null)} />}
       {modal === "settings" && <SettingsModal group={group} error={formError} recoveryKey={recoveryKey} onClose={() => { setModal(null); setFormError(""); }} onSubmit={updateSettings} onGenerateRecoveryKey={generateRecoveryKey} />}
       {modal === "people" && <PeopleModal members={uniqueMembers} currentParticipantId={group.participantId} canManage={group.role === "admin"} onRemove={removeMember} onClose={() => setModal(null)} />}
+      {modal === "verifyEmail" && <ProfileEmailModal email={group.email ?? ""} error={formError} onClose={() => { setModal(null); setFormError(""); }} onSubmit={verifyProfileEmail} onRequestCode={async (email) => {
+        setFormError("");
+        try {
+          const result = await jsonRequest("/api/profile/email", "POST", { email });
+          showToast("Verification code sent");
+          return result as { challenge: string; debugCode?: string };
+        } catch (error) {
+          setFormError(error instanceof Error ? error.message : "Could not send a verification code.");
+          throw error;
+        }
+      }} />}
       {modal === "switch" && <GroupSwitcher groups={group.accessibleGroups} activeSlug={group.slug} onSwitch={switchGroup} onCreate={() => setModal("create")} onJoin={() => { window.history.replaceState({}, "", "/"); setModal("join"); }} onRecover={() => { window.history.replaceState({}, "", "/"); setModal("recover"); }} onClose={() => setModal(null)} />}
       {modal === "creatorKey" && <CreatorKeyModal recoveryKey={recoveryKey} onCopy={copy} onClose={() => setModal(null)} />}
-      {modal && ["create", "join", "recover"].includes(modal) && <AuthModal mode={modal as "create" | "join" | "recover"} sharedGroup={new URLSearchParams(typeof window === "undefined" ? "" : window.location.search).get("group") ?? ""} error={formError} onClose={() => { setModal(null); setFormError(""); window.history.replaceState({}, "", `/?group=${encodeURIComponent(group.slug)}`); }} onSubmit={submitGroup} onMode={setModal} />}
+      {modal && ["create", "join", "recover"].includes(modal) && <AuthModal mode={modal as "create" | "join" | "recover"} sharedGroup={new URLSearchParams(typeof window === "undefined" ? "" : window.location.search).get("group") ?? ""} error={formError} onClose={() => { setModal(null); setFormError(""); window.history.replaceState({}, "", `/?group=${encodeURIComponent(group.slug)}`); }} onSubmit={submitGroup} onRequestCode={requestGroupCode} onMode={setModal} />}
       {toast && <div className="toast">{toast}</div>}
     </main>
   );
@@ -396,16 +438,74 @@ function ModalShell({ children, onClose, className = "" }: { children: React.Rea
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className={`modal ${className}`} role="dialog" aria-modal="true"><button className="modal-close" onClick={onClose} aria-label="Close">×</button>{children}</section></div>;
 }
 
-function AuthModal({ mode, sharedGroup, error, onClose, onSubmit, onMode }: { mode: "create" | "join" | "recover"; sharedGroup: string; error: string; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onMode: (modal: Modal) => void }) {
+function AuthModal({ mode, sharedGroup, error, onClose, onSubmit, onRequestCode, onMode }: {
+  mode: "create" | "join" | "recover"; sharedGroup: string; error: string; onClose: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onRequestCode: (data: Record<string, FormDataEntryValue>, mode: "create" | "join" | "recover") => Promise<{ challenge: string; debugCode?: string }>;
+  onMode: (modal: Modal) => void;
+}) {
+  const [challenge, setChallenge] = useState("");
+  const [debugCode, setDebugCode] = useState("");
+  const [sending, setSending] = useState(false);
+  const [useRecoveryKey, setUseRecoveryKey] = useState(false);
   const title = mode === "create" ? "Create your group" : mode === "recover" ? "Restore creator access" : "Join your group";
-  const copy = mode === "create" ? "Start a private space for everyone’s availability." : mode === "recover" ? "Use the recovery key shown when the group was created." : "No account needed. Just use the shared group details.";
+  const copy = mode === "create" ? "Start a private space secured by your verified email." : mode === "recover" ? "Verify the creator email to restore settings and member controls." : "The group password and a verified email are required.";
+  async function sendCode(event: React.MouseEvent<HTMLButtonElement>) {
+    const form = event.currentTarget.form;
+    if (!form || !form.reportValidity()) return;
+    setSending(true);
+    try {
+      const result = await onRequestCode(Object.fromEntries(new FormData(form)), mode);
+      setChallenge(result.challenge);
+      setDebugCode(result.debugCode ?? "");
+    } catch {
+      // The parent displays the service error.
+    } finally {
+      setSending(false);
+    }
+  }
   return <ModalShell onClose={onClose} className="auth-modal"><span className="modal-kicker">{mode === "create" ? "START AN OVERLAP" : mode === "recover" ? "CREATOR RECOVERY" : "ENTER THE OVERLAP"}</span><h2>{title}</h2><p>{copy}</p><form onSubmit={onSubmit}>
     <label><span>GROUP NAME</span><input name={mode === "create" ? "name" : "group"} defaultValue={mode !== "create" ? sharedGroup : ""} placeholder="e.g. Design team" required /></label>
-    {mode === "recover" ? <label><span>CREATOR RECOVERY KEY</span><input name="adminKey" placeholder="Paste your recovery key" required /></label> : <label><span>GROUP PASSWORD</span><input name="password" type="password" placeholder={mode === "create" ? "At least 6 characters" : "Enter the shared password"} minLength={6} required /></label>}
+    {mode !== "recover" && <label><span>GROUP PASSWORD</span><input name="password" type="password" placeholder={mode === "create" ? "At least 6 characters" : "Enter the shared password"} minLength={6} required readOnly={Boolean(challenge)} /></label>}
     <label><span>YOUR NAME</span><input name="displayName" placeholder="How the group will see you" required /></label>
+    {mode === "recover" && useRecoveryKey ? <label><span>CREATOR RECOVERY KEY</span><input name="adminKey" placeholder="Paste your recovery key" required /></label> : <>
+      <label><span>EMAIL ADDRESS</span><input name="email" type="email" placeholder="you@company.com" required readOnly={Boolean(challenge)} /></label>
+      {challenge && <><input name="challenge" type="hidden" value={challenge} /><label><span>6-DIGIT VERIFICATION CODE</span><input name="code" inputMode="numeric" pattern="[0-9]{6}" defaultValue={debugCode} autoComplete="one-time-code" placeholder="000000" required /></label></>}
+    </>}
     {error && <div className="form-error">{error}</div>}
-    <button className="modal-primary" type="submit">{mode === "create" ? "Create group" : mode === "recover" ? "Restore access" : "Join group"} <span>→</span></button>
+    {!useRecoveryKey && !challenge ? <button className="modal-primary" type="button" onClick={sendCode} disabled={sending}>{sending ? "Sending…" : "Send verification code"} <span>→</span></button> : <button className="modal-primary" type="submit">{mode === "create" ? "Create group" : mode === "recover" ? "Restore access" : "Join group"} <span>→</span></button>}
+    {challenge && <button className="text-button" type="button" onClick={() => { setChallenge(""); setDebugCode(""); }}>Use a different email</button>}
+    {mode === "recover" && <button className="text-button" type="button" onClick={() => { setUseRecoveryKey(!useRecoveryKey); setChallenge(""); }}>{useRecoveryKey ? "Use creator email instead" : "Use recovery key instead"}</button>}
   </form><div className="modal-switch">{mode === "create" ? <>Already have a group? <button onClick={() => onMode("join")}>Join it</button></> : mode === "recover" ? <>Have the password? <button onClick={() => onMode("join")}>Join normally</button></> : <>Creating something new? <button onClick={() => onMode("create")}>Create a group</button><small>or</small><button onClick={() => onMode("recover")}>I’m the creator</button></>}</div></ModalShell>;
+}
+
+function ProfileEmailModal({ email, error, onClose, onSubmit, onRequestCode }: {
+  email: string; error: string; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onRequestCode: (email: string) => Promise<{ challenge: string; debugCode?: string }>;
+}) {
+  const [challenge, setChallenge] = useState("");
+  const [debugCode, setDebugCode] = useState("");
+  const [sending, setSending] = useState(false);
+  async function sendCode(event: React.MouseEvent<HTMLButtonElement>) {
+    const form = event.currentTarget.form;
+    if (!form || !form.reportValidity()) return;
+    setSending(true);
+    try {
+      const result = await onRequestCode(String(new FormData(form).get("email") ?? ""));
+      setChallenge(result.challenge);
+      setDebugCode(result.debugCode ?? "");
+    } catch {
+      // The parent displays the service error.
+    } finally {
+      setSending(false);
+    }
+  }
+  return <ModalShell onClose={onClose}><span className="modal-kicker">PROFILE SECURITY</span><h2>Verify your email</h2><p>This links the current person and their calendar connections to your email, without creating a global account.</p><form onSubmit={onSubmit}>
+    <label><span>EMAIL ADDRESS</span><input name="email" type="email" defaultValue={email} placeholder="you@company.com" required readOnly={Boolean(challenge)} /></label>
+    {challenge && <><input name="challenge" type="hidden" value={challenge} /><label><span>6-DIGIT VERIFICATION CODE</span><input name="code" inputMode="numeric" pattern="[0-9]{6}" defaultValue={debugCode} autoComplete="one-time-code" placeholder="000000" required /></label></>}
+    {error && <div className="form-error">{error}</div>}
+    {!challenge ? <button className="modal-primary" type="button" onClick={sendCode} disabled={sending}>{sending ? "Sending…" : "Send verification code"} <span>→</span></button> : <button className="modal-primary" type="submit">Verify this profile <span>→</span></button>}
+  </form></ModalShell>;
 }
 
 function ConnectModal({ config, connectedProviders, error, onClose, onConnect, onConnectMcp }: { config: CalendarConfig; connectedProviders: string[]; error: string; onClose: () => void; onConnect: (provider: "google" | "microsoft") => void; onConnectMcp: (event: FormEvent<HTMLFormElement>) => void }) {
@@ -426,7 +526,7 @@ function SettingsModal({ group, error, recoveryKey, onClose, onSubmit, onGenerat
 }
 
 function PeopleModal({ members, currentParticipantId, canManage, onRemove, onClose }: { members: Array<Member & { providers: string[] }>; currentParticipantId: string; canManage: boolean; onRemove: (member: Member) => void; onClose: () => void }) {
-  return <ModalShell onClose={onClose}><span className="modal-kicker">GROUP MEMBERS</span><h2>People in this overlap</h2><p>{canManage ? "As the creator, you can remove duplicate or former members." : "Only the group creator can remove people."}</p><div className="people-list">{members.map((member) => <div key={member.id}><span className={`avatar ${member.color}`}>{initials(member.displayName)}</span><p><strong>{member.displayName}{member.id === currentParticipantId ? " (you)" : ""}</strong><small>{member.providers.length ? member.providers.map((item) => item === "google" ? "Google" : item === "microsoft" ? "Microsoft" : "MCP").join(" + ") : "Calendar not connected"}</small></p><b className={member.providers.length ? "ready" : ""}>{member.providers.length ? "Ready" : "Waiting"}</b>{canManage && member.id !== currentParticipantId && <button className="remove-member" type="button" onClick={() => onRemove(member)}>Remove</button>}</div>)}</div></ModalShell>;
+  return <ModalShell onClose={onClose}><span className="modal-kicker">GROUP MEMBERS</span><h2>People in this overlap</h2><p>{canManage ? "As the creator, you can remove duplicate or former members." : "Only the group creator can remove people."}</p><div className="people-list">{members.map((member) => <div key={member.id}><span className={`avatar ${member.color}`}>{initials(member.displayName)}</span><p><strong>{member.displayName}{member.id === currentParticipantId ? " (you)" : ""}{member.isCreator ? " · Creator" : ""}</strong><small>{member.providers.length ? member.providers.map((item) => item === "google" ? "Google" : item === "microsoft" ? "Microsoft" : "MCP").join(" + ") : "Calendar not connected"} · {member.emailVerified ? "Email verified" : "Email not verified"}</small></p><b className={member.providers.length ? "ready" : ""}>{member.providers.length ? "Ready" : "Waiting"}</b>{canManage && member.id !== currentParticipantId && !member.isCreator && <button className="remove-member" type="button" onClick={() => onRemove(member)}>Remove</button>}</div>)}</div></ModalShell>;
 }
 
 function GroupSwitcher({ groups, activeSlug, onSwitch, onCreate, onJoin, onRecover, onClose }: { groups: GroupAccess[]; activeSlug: string; onSwitch: (slug: string) => void; onCreate: () => void; onJoin: () => void; onRecover: () => void; onClose: () => void }) {

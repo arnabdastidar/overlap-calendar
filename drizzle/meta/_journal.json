@@ -15,6 +15,13 @@
       "when": 1786985741823,
       "tag": "0001_cooing_lilith",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1787003908602,
+      "tag": "0002_clumsy_madame_masque",
+      "breakpoints": true
     }
   ]
 }

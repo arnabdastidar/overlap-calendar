@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const groups = sqliteTable("groups", {
@@ -20,8 +21,15 @@ export const participants = sqliteTable("participants", {
   groupId: text("group_id").notNull().references(() => groups.id, { onDelete: "cascade" }),
   displayName: text("display_name").notNull(),
   color: text("color").notNull(),
+  email: text("email"),
+  emailKey: text("email_key"),
+  emailVerifiedAt: integer("email_verified_at"),
+  isCreator: integer("is_creator", { mode: "boolean" }).notNull().default(false),
   createdAt: integer("created_at").notNull(),
-}, (table) => [index("idx_participants_group_id").on(table.groupId)]);
+}, (table) => [
+  index("idx_participants_group_id").on(table.groupId),
+  uniqueIndex("idx_participants_group_email").on(table.groupId, table.emailKey).where(sql`${table.emailKey} IS NOT NULL`),
+]);
 
 export const sessions = sqliteTable("sessions", {
   tokenHash: text("token_hash").primaryKey(),
@@ -49,3 +57,17 @@ export const oauthStates = sqliteTable("oauth_states", {
   redirectUri: text("redirect_uri").notNull(),
   expiresAt: integer("expires_at").notNull(),
 });
+
+export const emailVerifications = sqliteTable("email_verifications", {
+  challengeHash: text("challenge_hash").primaryKey(),
+  groupId: text("group_id").references(() => groups.id, { onDelete: "cascade" }),
+  participantId: text("participant_id").references(() => participants.id, { onDelete: "cascade" }),
+  emailKey: text("email_key").notNull(),
+  purpose: text("purpose", { enum: ["create", "join", "creator", "profile"] }).notNull(),
+  codeHash: text("code_hash").notNull(),
+  expiresAt: integer("expires_at").notNull(),
+  attempts: integer("attempts").notNull().default(0),
+  createdAt: integer("created_at").notNull(),
+}, (table) => [
+  index("idx_email_verifications_email_created").on(table.emailKey, table.createdAt),
+]);

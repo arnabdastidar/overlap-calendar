@@ -105,3 +105,33 @@ test("only creators can remove another participant", async () => {
   assert.match(page, /Remove/);
   assert.match(page, /group\.role === "admin"/);
 });
+
+test("group access requires a short-lived verified email code", async () => {
+  const [serverData, emailRoute, emailSender, schema] = await Promise.all([
+    readFile(new URL("lib/server-data.ts", root), "utf8"),
+    readFile(new URL("app/api/email-verification/route.ts", root), "utf8"),
+    readFile(new URL("lib/email.ts", root), "utf8"),
+    readFile(new URL("db/schema.ts", root), "utf8"),
+  ]);
+  assert.match(serverData, /requestEmailVerification/);
+  assert.match(serverData, /sixDigitCode/);
+  assert.match(serverData, /expires_at/);
+  assert.match(serverData, /verification\.attempts\) >= 5/);
+  assert.match(emailRoute, /purpose/);
+  assert.match(emailSender, /api\.resend\.com\/emails/);
+  assert.match(schema, /emailVerifications/);
+});
+
+test("a verified email reopens the same participant and calendar profile", async () => {
+  const [serverData, page, profileRoute] = await Promise.all([
+    readFile(new URL("lib/server-data.ts", root), "utf8"),
+    readFile(new URL("app/page.tsx", root), "utf8"),
+    readFile(new URL("app/api/profile/email/route.ts", root), "utf8"),
+  ]);
+  assert.match(serverData, /WHERE group_id = \? AND email_key = \?/);
+  assert.match(serverData, /mergeParticipantInto/);
+  assert.match(serverData, /UPDATE sessions SET participant_id/);
+  assert.match(page, /Verify your email/);
+  assert.match(page, /Email verified/);
+  assert.match(profileRoute, /verifyCurrentProfileEmail/);
+});
