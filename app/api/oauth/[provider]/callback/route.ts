@@ -18,7 +18,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ prov
       accountRef: `oauth:${state.participantId}:${provider}`,
       displayName: provider === "google" ? "Google Calendar" : "Microsoft Outlook",
     });
-    return Response.redirect(`${origin}/?connected=${provider}`);
+    return Response.redirect(`${origin}/?group=${encodeURIComponent(state.slug)}&connected=${provider}`);
   } catch (error) {
     const message = encodeURIComponent(error instanceof Error ? error.message : "Calendar connection failed.");
     return Response.redirect(`${origin}/?calendar_error=${message}`);

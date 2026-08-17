@@ -3,13 +3,14 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 type Member = { id: string; displayName: string; color: string; provider: string | null; calendarName: string | null; isDemo: boolean };
+type GroupAccess = { groupName: string; slug: string; role: "admin" | "member"; participantId: string };
 type Group = {
   groupName: string; slug: string; displayName: string; role: "admin" | "member";
-  participantId: string; members: Member[];
+  participantId: string; members: Member[]; accessibleGroups: GroupAccess[];
 };
 type Slot = { start: string; end: string };
 type CalendarConfig = { google: boolean; microsoft: boolean; mcp: boolean; demo: boolean };
-type Modal = "create" | "join" | "recover" | "connect" | "share" | "settings" | "people" | null;
+type Modal = "create" | "join" | "recover" | "creatorKey" | "switch" | "connect" | "share" | "settings" | "people" | null;
 
 const durations = Array.from({ length: 10 }, (_, index) => (index + 1) * 30);
 
@@ -28,9 +29,15 @@ function durationLabel(minutes: number) {
 }
 
 function jsonRequest(url: string, method: string, body?: unknown) {
+  const headers: Record<string, string> = {};
+  if (body) headers["content-type"] = "application/json";
+  if (typeof window !== "undefined") {
+    const activeGroup = new URLSearchParams(window.location.search).get("group");
+    if (activeGroup) headers["x-overlap-group"] = activeGroup;
+  }
   return fetch(url, {
     method,
-    headers: body ? { "content-type": "application/json" } : undefined,
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   }).then(async (response) => {
     const data = await response.json();
@@ -60,9 +67,10 @@ export default function Home() {
     window.setTimeout(() => setToast(""), 3200);
   }, []);
 
-  const loadGroup = useCallback(async () => {
+  const loadGroup = useCallback(async (slug?: string) => {
     try {
-      const data = await jsonRequest("/api/groups", "GET");
+      const suffix = slug !== undefined ? `?group=${encodeURIComponent(slug)}` : "";
+      const data = await jsonRequest(`/api/groups${suffix}`, "GET");
       setGroup(data.group);
       setStatus("group");
       return data.group as Group;
@@ -75,6 +83,8 @@ export default function Home() {
 
   const findTimes = useCallback(async (quiet = false) => {
     if (!group && status !== "group") return;
+    const selectedGroup = new URLSearchParams(window.location.search).get("group");
+    if (selectedGroup && group && selectedGroup !== group.slug) return;
     setFinding(true);
     try {
       const data = await jsonRequest(`/api/availability?duration=${duration}&days=${days}&timezone=${encodeURIComponent(timezone)}`, "GET");
@@ -94,12 +104,18 @@ export default function Home() {
       const params = new URLSearchParams(window.location.search);
       const connected = params.get("connected");
       const calendarError = params.get("calendar_error");
+      const requestedGroup = params.get("group") ?? undefined;
       if (connected) showToast(`${connected === "google" ? "Google" : "Microsoft"} Calendar connected`);
       if (calendarError) showToast(calendarError);
-      if (connected || calendarError) window.history.replaceState({}, "", "/");
+      if (connected || calendarError) {
+        params.delete("connected");
+        params.delete("calendar_error");
+        window.history.replaceState({}, "", params.size ? `/?${params}` : "/");
+      }
       void jsonRequest("/api/calendars/config", "GET").then(setCalendarConfig).catch(() => undefined);
-      loadGroup().then((activeGroup) => {
-        if (!activeGroup && params.get("group")) setModal("join");
+      loadGroup(requestedGroup).then((activeGroup) => {
+        if (!activeGroup && requestedGroup) setModal("join");
+        else if (activeGroup && requestedGroup && activeGroup.slug !== requestedGroup) setModal("join");
       });
     }, 0);
     return () => window.clearTimeout(timeout);
@@ -143,19 +159,22 @@ export default function Home() {
     setFormError("");
     const data = Object.fromEntries(new FormData(event.currentTarget));
     try {
+      let result: { slug: string; adminKey?: string };
       if (modal === "create") {
-        const result = await jsonRequest("/api/groups", "POST", data);
-        setRecoveryKey(result.adminKey);
-        showToast("Group created — save the creator recovery key");
+        result = await jsonRequest("/api/groups", "POST", data);
+        setRecoveryKey(result.adminKey ?? "");
       } else if (modal === "recover") {
-        await jsonRequest("/api/groups/recover", "POST", data);
+        result = await jsonRequest("/api/groups/recover", "POST", data);
+        setRecoveryKey(String(data.adminKey ?? ""));
         showToast("Creator access restored");
       } else {
-        await jsonRequest("/api/groups/join", "POST", data);
+        result = await jsonRequest("/api/groups/join", "POST", data);
+        setRecoveryKey("");
         showToast("You’re in");
       }
-      setModal(null);
-      await loadGroup();
+      window.history.replaceState({}, "", `/?group=${encodeURIComponent(result.slug)}`);
+      await loadGroup(result.slug);
+      setModal(modal === "create" ? "creatorKey" : null);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Could not continue.");
     }
@@ -199,20 +218,45 @@ export default function Home() {
     const raw = Object.fromEntries(new FormData(event.currentTarget)) as Record<string, string>;
     const payload = Object.fromEntries(Object.entries(raw).filter(([, value]) => value.trim()));
     try {
-      await jsonRequest("/api/groups/settings", "PATCH", payload);
+      const result = await jsonRequest("/api/groups/settings", "PATCH", payload);
+      const nextSlug = result.slug ?? group?.slug;
+      if (nextSlug) window.history.replaceState({}, "", `/?group=${encodeURIComponent(nextSlug)}`);
       setModal(null);
-      await loadGroup();
+      await loadGroup(nextSlug);
       showToast("Group settings updated");
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Could not update the group.");
     }
   }
 
-  async function leave() {
-    await jsonRequest("/api/groups/leave", "POST");
+  async function switchGroup(slug: string) {
+    setRecoveryKey("");
     setModal(null);
     setSlots([]);
-    await loadGroup();
+    window.history.replaceState({}, "", `/?group=${encodeURIComponent(slug)}`);
+    await loadGroup(slug);
+  }
+
+  async function generateRecoveryKey() {
+    setFormError("");
+    try {
+      const result = await jsonRequest("/api/groups/recovery-key", "POST");
+      setRecoveryKey(result.adminKey);
+      showToast("New creator recovery key generated");
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : "Could not generate a recovery key.");
+    }
+  }
+
+  async function removeMember(member: Member) {
+    if (!window.confirm(`Remove ${member.displayName} and their connected calendars from this group?`)) return;
+    try {
+      await jsonRequest(`/api/groups/members/${encodeURIComponent(member.id)}`, "DELETE");
+      await loadGroup(group?.slug);
+      showToast(`${member.displayName} removed`);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "Could not remove that person.");
+    }
   }
 
   async function copy(value: string, message: string) {
@@ -268,12 +312,12 @@ export default function Home() {
       <aside className="sidebar">
         <Brand />
         <nav className="nav" aria-label="Workspace navigation">
-          <p className="nav-label">YOUR GROUP</p>
-          <button className="group-row active" type="button">
-            <span className="group-icon">{initials(group.groupName)}</span>
-            <span><strong>{group.groupName}</strong><small>{connectedCount} connected</small></span><b>›</b>
-          </button>
-          <button className="new-group" type="button" onClick={leave}><span>＋</span> Create or join another</button>
+          <p className="nav-label">YOUR GROUPS</p>
+          {group.accessibleGroups.map((item) => <button className={`group-row ${item.slug === group.slug ? "active" : ""}`} type="button" onClick={() => switchGroup(item.slug)} key={item.slug}>
+            <span className="group-icon">{initials(item.groupName)}</span>
+            <span><strong>{item.groupName}</strong><small>{item.role === "admin" ? "Creator" : "Member"}</small></span><b>›</b>
+          </button>)}
+          <button className="new-group" type="button" onClick={() => setModal("switch")}><span>＋</span> Create or join another</button>
         </nav>
         <div className="sidebar-note"><span>?</span><div><strong>Privacy first</strong><small>Only free/busy is read.</small></div></div>
         <p className="open-source">Open source · MIT</p>
@@ -281,7 +325,7 @@ export default function Home() {
 
       <section className="workspace">
         <header className="topbar">
-          <div><span className="eyebrow">SHARED AVAILABILITY</span><h1>{group.groupName}</h1></div>
+          <div><span className="eyebrow">SHARED AVAILABILITY</span><button className="group-title-button" type="button" onClick={() => setModal("switch")}><h1>{group.groupName}</h1><span>⌄</span></button></div>
           <div className="top-actions">
             {group.role === "admin" && <button className="icon-button" aria-label="Group settings" onClick={() => setModal("settings")}>⚙</button>}
             <button className="share-button" onClick={() => setModal("share")}><span>↗</span> Share group</button>
@@ -338,8 +382,11 @@ export default function Home() {
 
       {modal === "connect" && <ConnectModal config={calendarConfig} connectedProviders={connectedProviders} error={formError} onClose={() => { setModal(null); setFormError(""); }} onConnect={connect} onConnectMcp={connectMcp} />}
       {modal === "share" && <ShareModal group={group} shareUrl={shareUrl} recoveryKey={recoveryKey} onCopy={copy} onClose={() => setModal(null)} />}
-      {modal === "settings" && <SettingsModal group={group} error={formError} recoveryKey={recoveryKey} onClose={() => { setModal(null); setFormError(""); }} onSubmit={updateSettings} />}
-      {modal === "people" && <PeopleModal members={uniqueMembers} onClose={() => setModal(null)} />}
+      {modal === "settings" && <SettingsModal group={group} error={formError} recoveryKey={recoveryKey} onClose={() => { setModal(null); setFormError(""); }} onSubmit={updateSettings} onGenerateRecoveryKey={generateRecoveryKey} />}
+      {modal === "people" && <PeopleModal members={uniqueMembers} currentParticipantId={group.participantId} canManage={group.role === "admin"} onRemove={removeMember} onClose={() => setModal(null)} />}
+      {modal === "switch" && <GroupSwitcher groups={group.accessibleGroups} activeSlug={group.slug} onSwitch={switchGroup} onCreate={() => setModal("create")} onJoin={() => { window.history.replaceState({}, "", "/"); setModal("join"); }} onRecover={() => { window.history.replaceState({}, "", "/"); setModal("recover"); }} onClose={() => setModal(null)} />}
+      {modal === "creatorKey" && <CreatorKeyModal recoveryKey={recoveryKey} onCopy={copy} onClose={() => setModal(null)} />}
+      {modal && ["create", "join", "recover"].includes(modal) && <AuthModal mode={modal as "create" | "join" | "recover"} sharedGroup={new URLSearchParams(typeof window === "undefined" ? "" : window.location.search).get("group") ?? ""} error={formError} onClose={() => { setModal(null); setFormError(""); window.history.replaceState({}, "", `/?group=${encodeURIComponent(group.slug)}`); }} onSubmit={submitGroup} onMode={setModal} />}
       {toast && <div className="toast">{toast}</div>}
     </main>
   );
@@ -374,10 +421,18 @@ function ShareModal({ group, shareUrl, recoveryKey, onCopy, onClose }: { group: 
   return <ModalShell onClose={onClose}><span className="modal-kicker">INVITE YOUR GROUP</span><h2>Share the overlap</h2><p>Send the link and password separately. Anyone with both can join.</p><label className="copy-field"><span>GROUP LINK</span><div><input value={shareUrl} readOnly /><button onClick={() => onCopy(shareUrl, "Group link copied")}>Copy</button></div></label><label className="copy-field"><span>GROUP NAME</span><div><input value={group.groupName} readOnly /><button onClick={() => onCopy(group.groupName, "Group name copied")}>Copy</button></div></label>{recoveryKey && <div className="recovery-note"><strong>Save your creator recovery key</strong><code>{recoveryKey}</code><button onClick={() => onCopy(recoveryKey, "Recovery key copied")}>Copy key</button></div>}<small className="share-hint">For privacy, the group password is never displayed after setup.</small></ModalShell>;
 }
 
-function SettingsModal({ group, error, recoveryKey, onClose, onSubmit }: { group: Group; error: string; recoveryKey: string; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <ModalShell onClose={onClose}><span className="modal-kicker">CREATOR SETTINGS</span><h2>Group settings</h2><p>Leave a field blank to keep its current value.</p><form onSubmit={onSubmit}><label><span>GROUP NAME</span><input name="name" defaultValue={group.groupName} /></label><label><span>NEW PASSWORD</span><input name="password" type="password" minLength={6} placeholder="At least 6 characters" /></label>{recoveryKey && <label><span>RECOVERY KEY</span><input value={recoveryKey} readOnly /></label>}{error && <div className="form-error">{error}</div>}<button className="modal-primary" type="submit">Save changes <span>→</span></button></form></ModalShell>;
+function SettingsModal({ group, error, recoveryKey, onClose, onSubmit, onGenerateRecoveryKey }: { group: Group; error: string; recoveryKey: string; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onGenerateRecoveryKey: () => void }) {
+  return <ModalShell onClose={onClose}><span className="modal-kicker">CREATOR SETTINGS</span><h2>Group settings</h2><p>Leave a field blank to keep its current value.</p><form onSubmit={onSubmit}><label><span>GROUP NAME</span><input name="name" defaultValue={group.groupName} /></label><label><span>NEW PASSWORD</span><input name="password" type="password" minLength={6} placeholder="At least 6 characters" /></label>{error && <div className="form-error">{error}</div>}<button className="modal-primary" type="submit">Save changes <span>→</span></button></form><div className="recovery-settings"><strong>Creator recovery</strong><p>The recovery key is different from the group password. Generating a new key disables the previous one.</p>{recoveryKey ? <label className="copy-field"><span>RECOVERY KEY</span><div><input value={recoveryKey} readOnly /><button onClick={() => navigator.clipboard.writeText(recoveryKey)}>Copy</button></div></label> : <button className="secondary-button" type="button" onClick={onGenerateRecoveryKey}>Generate a new recovery key</button>}</div></ModalShell>;
 }
 
-function PeopleModal({ members, onClose }: { members: Array<Member & { providers: string[] }>; onClose: () => void }) {
-  return <ModalShell onClose={onClose}><span className="modal-kicker">GROUP MEMBERS</span><h2>People in this overlap</h2><div className="people-list">{members.map((member) => <div key={member.id}><span className={`avatar ${member.color}`}>{initials(member.displayName)}</span><p><strong>{member.displayName}</strong><small>{member.providers.length ? member.providers.map((item) => item === "google" ? "Google" : item === "microsoft" ? "Microsoft" : "MCP").join(" + ") : "Calendar not connected"}</small></p><b className={member.providers.length ? "ready" : ""}>{member.providers.length ? "Ready" : "Waiting"}</b></div>)}</div></ModalShell>;
+function PeopleModal({ members, currentParticipantId, canManage, onRemove, onClose }: { members: Array<Member & { providers: string[] }>; currentParticipantId: string; canManage: boolean; onRemove: (member: Member) => void; onClose: () => void }) {
+  return <ModalShell onClose={onClose}><span className="modal-kicker">GROUP MEMBERS</span><h2>People in this overlap</h2><p>{canManage ? "As the creator, you can remove duplicate or former members." : "Only the group creator can remove people."}</p><div className="people-list">{members.map((member) => <div key={member.id}><span className={`avatar ${member.color}`}>{initials(member.displayName)}</span><p><strong>{member.displayName}{member.id === currentParticipantId ? " (you)" : ""}</strong><small>{member.providers.length ? member.providers.map((item) => item === "google" ? "Google" : item === "microsoft" ? "Microsoft" : "MCP").join(" + ") : "Calendar not connected"}</small></p><b className={member.providers.length ? "ready" : ""}>{member.providers.length ? "Ready" : "Waiting"}</b>{canManage && member.id !== currentParticipantId && <button className="remove-member" type="button" onClick={() => onRemove(member)}>Remove</button>}</div>)}</div></ModalShell>;
+}
+
+function GroupSwitcher({ groups, activeSlug, onSwitch, onCreate, onJoin, onRecover, onClose }: { groups: GroupAccess[]; activeSlug: string; onSwitch: (slug: string) => void; onCreate: () => void; onJoin: () => void; onRecover: () => void; onClose: () => void }) {
+  return <ModalShell onClose={onClose}><span className="modal-kicker">YOUR OVERLAPS</span><h2>Switch groups</h2><p>This browser keeps each group separate, including its calendars and creator access.</p><div className="group-switch-list">{groups.map((item) => <button type="button" className={item.slug === activeSlug ? "active" : ""} onClick={() => onSwitch(item.slug)} key={item.slug}><span className="group-icon">{initials(item.groupName)}</span><span><strong>{item.groupName}</strong><small>{item.role === "admin" ? "Creator" : "Member"}</small></span><b>{item.slug === activeSlug ? "Current" : "Open"}</b></button>)}</div><div className="group-switch-actions"><button className="modal-primary" type="button" onClick={onCreate}>Create a new group</button><button className="secondary-button" type="button" onClick={onJoin}>Join an existing group</button><button className="text-button" type="button" onClick={onRecover}>Restore creator access</button></div></ModalShell>;
+}
+
+function CreatorKeyModal({ recoveryKey, onCopy, onClose }: { recoveryKey: string; onCopy: (value: string, message: string) => void; onClose: () => void }) {
+  return <ModalShell onClose={onClose}><span className="modal-kicker">CREATOR RECOVERY</span><h2>Save this key now</h2><p>This recovery key is different from the group password. It restores creator controls if this browser loses access, and it remains visible only until the page is reloaded.</p><label className="copy-field"><span>CREATOR RECOVERY KEY</span><div><input value={recoveryKey} readOnly /><button onClick={() => onCopy(recoveryKey, "Recovery key copied")}>Copy key</button></div></label><button className="modal-primary" type="button" onClick={onClose}>I saved the key <span>→</span></button></ModalShell>;
 }

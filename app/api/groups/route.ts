@@ -19,7 +19,7 @@ export async function POST(request: Request) {
     const result = await createGroup({ name: body.name ?? "", password: body.password ?? "", displayName: body.displayName ?? "" });
     return new Response(JSON.stringify({ slug: result.slug, adminKey: result.adminKey }), {
       status: 201,
-      headers: { "content-type": "application/json", "set-cookie": sessionCookie(result.token) },
+      headers: { "content-type": "application/json", "set-cookie": sessionCookie(request, result.token) },
     });
   } catch (error) {
     return errorResponse(error);

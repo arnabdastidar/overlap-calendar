@@ -62,3 +62,46 @@ test("calendar connection state stays visible in the connect modal", async () =>
   assert.match(page, /Connected to this overlap/);
   assert.match(page, /✓ Connected/);
 });
+
+test("one browser can retain and switch between multiple group sessions", async () => {
+  const [page, serverData, groupsRoute] = await Promise.all([
+    readFile(new URL("app/page.tsx", root), "utf8"),
+    readFile(new URL("lib/server-data.ts", root), "utf8"),
+    readFile(new URL("app/api/groups/route.ts", root), "utf8"),
+  ]);
+  assert.match(serverData, /sessionTokens/);
+  assert.match(serverData, /requestedGroup/);
+  assert.match(serverData, /accessibleGroups/);
+  assert.match(groupsRoute, /sessionCookie\(request, result\.token\)/);
+  assert.match(page, /accessibleGroups/);
+  assert.match(page, /switchGroup/);
+  assert.doesNotMatch(page, /onClick=\{leave\}/);
+});
+
+test("creator recovery restores the original creator and can rotate the key", async () => {
+  const [page, serverData, recoveryRoute] = await Promise.all([
+    readFile(new URL("app/page.tsx", root), "utf8"),
+    readFile(new URL("lib/server-data.ts", root), "utf8"),
+    readFile(new URL("app/api/groups/recovery-key/route.ts", root), "utf8"),
+  ]);
+  assert.match(serverData, /ORDER BY created_at ASC/);
+  assert.match(serverData, /UPDATE participants SET display_name/);
+  assert.match(serverData, /rotateRecoveryKey/);
+  assert.match(recoveryRoute, /rotateRecoveryKey/);
+  assert.match(page, /Generate a new recovery key/);
+  assert.match(page, /different from the group password/i);
+});
+
+test("only creators can remove another participant", async () => {
+  const [page, serverData, memberRoute] = await Promise.all([
+    readFile(new URL("app/page.tsx", root), "utf8"),
+    readFile(new URL("lib/server-data.ts", root), "utf8"),
+    readFile(new URL("app/api/groups/members/[participantId]/route.ts", root), "utf8"),
+  ]);
+  assert.match(serverData, /removeGroupMember/);
+  assert.match(serverData, /cannot remove yourself/i);
+  assert.match(serverData, /DELETE FROM participants/);
+  assert.match(memberRoute, /removeGroupMember/);
+  assert.match(page, /Remove/);
+  assert.match(page, /group\.role === "admin"/);
+});
