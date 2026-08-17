@@ -1,4 +1,5 @@
 const encoder = new TextEncoder();
+const PBKDF2_ITERATIONS = 100_000;
 
 function bytesToHex(bytes: Uint8Array) {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -27,7 +28,7 @@ export async function sha256(value: string) {
 export async function hashPassword(password: string, salt = randomToken(16)) {
   const key = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt: encoder.encode(salt), iterations: 210_000 },
+    { name: "PBKDF2", hash: "SHA-256", salt: encoder.encode(salt), iterations: PBKDF2_ITERATIONS },
     key,
     256,
   );

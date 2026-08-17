@@ -124,7 +124,7 @@ Browser
                     └─> shared slots only
 ```
 
-The web app is React 19 on Vinext and Cloudflare Workers. D1 stores groups, password hashes, members, short-lived session hashes, OAuth state, and encrypted refresh tokens. PBKDF2-SHA-256 with 210,000 iterations protects group passwords.
+The web app is React 19 on Vinext and Cloudflare Workers. D1 stores groups, password hashes, members, short-lived session hashes, OAuth state, and encrypted refresh tokens. PBKDF2-SHA-256 with 100,000 iterations protects group passwords within the Workers runtime limit.
 
 ## Privacy and security choices
 

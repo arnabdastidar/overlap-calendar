@@ -32,3 +32,9 @@ test("calendar integration is scoped to availability", async () => {
   assert.match(providers, /calendar\.freebusy/);
   assert.match(providers, /Calendars\.Read/);
 });
+
+test("password hashing stays within the deployed runtime limit", async () => {
+  const cryptoSource = await readFile(new URL("lib/crypto.ts", root), "utf8");
+  assert.match(cryptoSource, /PBKDF2_ITERATIONS = 100_000/);
+  assert.doesNotMatch(cryptoSource, /iterations:\s*(?:1\d{5,}|[2-9]\d{5,})/);
+});
