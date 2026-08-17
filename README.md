@@ -6,6 +6,8 @@ Overlap is a privacy-first group availability portal for Google Calendar and Mic
 
 ![Overlap social preview](public/og.png)
 
+**Live app:** [overlapfinder.com](https://overlapfinder.com)
+
 ## What it does
 
 - Creates private groups without app accounts or email login
@@ -22,7 +24,7 @@ Overlap is a privacy-first group availability portal for Google Calendar and Mic
 1. A creator chooses a globally unique group name, password, and display name.
 2. Overlap returns a one-time creator recovery key.
 3. Members open the shared link and enter the group password plus a display name.
-4. Each person connects Google, Microsoft, or a self-hosted Calendar MCP account.
+4. Each person privately authorizes Google, Microsoft, or an administrator-provisioned Calendar MCP account. One participant can connect both Google and Microsoft calendars.
 5. The availability board intersects busy blocks and shows the times everyone shares.
 
 ## Run locally
@@ -54,9 +56,11 @@ npm run build
 npm run db:generate
 ```
 
-## How open-source deployments work
+## How calendar connections work in an open-source deployment
 
-The repository contains the application code, not reusable Google or Microsoft secrets. Every person or organization hosting Overlap creates its own OAuth applications and stores those credentials in its deployment environment. Those values must never be committed to GitHub.
+The repository contains the application code, not reusable Google or Microsoft credentials. Every person or organization hosting Overlap creates one Google OAuth client and one Microsoft Entra application for its deployment, then stores those credentials as deployment secrets. Group creators and participants do not create their own OAuth applications.
+
+The same deployment can serve people with personal accounts and people in different organizations. Configure Google as an external web application and Microsoft as a multitenant application that accepts organizational and personal Microsoft accounts. Each participant still signs in to their own provider and grants access only to their own calendar; the deployment does not receive blanket access to an organization.
 
 When a participant clicks a provider button:
 
@@ -64,9 +68,14 @@ When a participant clicks a provider button:
 2. The provider shows the calendar-only permission request.
 3. The provider sends an authorization code back to that Overlap deployment.
 4. Overlap encrypts the returned refresh token before storing it.
-5. Availability checks request busy intervals and intersect them in memory. They do not save event content.
+5. The connection dialog marks that provider as connected for that participant.
+6. Availability checks request busy intervals and intersect them in memory. They do not save event content.
 
-This is the same operating model used by most self-hosted OAuth applications: source code is shared, while every deployment owns its domains, OAuth consent configuration, and secrets.
+Google is limited to free/busy access. Microsoft is limited to read-only calendar access. Overlap never requests email, contacts, event notes, guests, or attachments.
+
+An open-source MCP server does not remove the provider-consent requirement: Google and Microsoft still require every calendar owner to authorize access. The optional Calendar MCP integration is intended for accounts provisioned by a deployment administrator; direct OAuth is the recommended participant-driven flow.
+
+This is the standard self-hosted OAuth model: source code is shared, while every deployment owns its domain, consent configuration, and secrets. Those values must never be committed to GitHub.
 
 ## Calendar connection modes
 
