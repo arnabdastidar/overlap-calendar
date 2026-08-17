@@ -12,7 +12,7 @@ export async function POST(request: Request) {
         })
       : await recoverGroup({ group: body.group ?? "", adminKey: body.adminKey ?? "", displayName: body.displayName ?? "" });
     return new Response(JSON.stringify({ slug: result.slug }), {
-      headers: { "content-type": "application/json", "set-cookie": sessionCookie(request, result.token) },
+      headers: { "content-type": "application/json", "set-cookie": await sessionCookie(request, result.token) },
     });
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "Could not restore creator access." }, { status: 400 });

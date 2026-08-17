@@ -18,7 +18,7 @@ cp .env.example .env
 npm run dev
 ```
 
-The default configuration uses demo busy blocks, so contributors do not need provider credentials. Never commit `.env`, OAuth secrets, refresh tokens, exported calendar data, or live group credentials.
+The default configuration does not substitute demo busy blocks or bypass email verification. Configure Resend to exercise create/join flows, and configure at least one OAuth provider to exercise live availability. Contributors may intentionally set `ENABLE_DEMO_CALENDARS=true` for local UI work only. Never commit `.env`, OAuth secrets, refresh tokens, exported calendar data, or live group credentials.
 
 ## Pull requests
 

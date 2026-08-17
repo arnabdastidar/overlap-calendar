@@ -3,7 +3,6 @@ import { env } from "cloudflare:workers";
 type EmailEnv = {
   RESEND_API_KEY?: string;
   EMAIL_FROM?: string;
-  EMAIL_VERIFICATION_DEBUG?: string;
 };
 
 const emailEnv = env as unknown as EmailEnv;
@@ -24,10 +23,7 @@ export async function sendVerificationEmail(input: {
   groupName?: string | null;
   idempotencyKey: string;
 }) {
-  if (emailEnv.EMAIL_VERIFICATION_DEBUG?.toLowerCase() === "true") {
-    return { debugCode: input.code };
-  }
-  if (!emailEnv.RESEND_API_KEY) {
+  if (!emailEnv.RESEND_API_KEY || !emailEnv.EMAIL_FROM) {
     throw new Error("Email verification is not configured on this deployment yet.");
   }
 
@@ -40,7 +36,7 @@ export async function sendVerificationEmail(input: {
       "idempotency-key": input.idempotencyKey,
     },
     body: JSON.stringify({
-      from: emailEnv.EMAIL_FROM ?? "Overlap <verify@overlapfinder.com>",
+      from: emailEnv.EMAIL_FROM,
       to: [input.email],
       subject: `${input.code} is your Overlap verification code`,
       text: `Your Overlap verification code${input.groupName ? ` for ${input.groupName}` : ""} is ${input.code}. It expires in 10 minutes. If you did not request this code, you can ignore this email.`,
@@ -48,8 +44,8 @@ export async function sendVerificationEmail(input: {
     }),
   });
   if (!response.ok) {
-    const body = await response.json().catch(() => null) as { message?: string } | null;
-    throw new Error(body?.message ?? "The verification email could not be sent.");
+    console.error("Verification email provider rejected the request", response.status);
+    throw new Error("The verification email could not be sent. The deployment owner should check the sender configuration.");
   }
   return {};
 }

@@ -1,6 +1,8 @@
 import { env } from "cloudflare:workers";
 import { hashPassword, randomToken, sha256, verifyPassword } from "./crypto";
 import { sendVerificationEmail } from "./email";
+import { preferSourceConnection } from "./identity-policy";
+import { consumeVerificationSql, incrementVerificationAttemptSql, incrementVerificationRateSql } from "./verification-queries";
 
 export type Provider = "google" | "microsoft" | "mcp";
 
@@ -14,7 +16,6 @@ type AppEnv = {
   CALENDAR_MCP_URL?: string;
   CALENDAR_MCP_API_KEY?: string;
   ENABLE_DEMO_CALENDARS?: string;
-  MAINTENANCE_TOKEN?: string;
 };
 
 export const appEnv = env as unknown as AppEnv;
@@ -75,21 +76,18 @@ async function initializeDatabase() {
         email_key TEXT NOT NULL, purpose TEXT NOT NULL, code_hash TEXT NOT NULL,
         expires_at INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
       )`),
+      database.prepare(`CREATE TABLE IF NOT EXISTS verification_rate_limits (
+        scope_key TEXT NOT NULL, window_start INTEGER NOT NULL, request_count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(scope_key, window_start)
+      )`),
       database.prepare("CREATE INDEX IF NOT EXISTS idx_participants_group_id ON participants(group_id)"),
       database.prepare("CREATE INDEX IF NOT EXISTS idx_sessions_group_id ON sessions(group_id)"),
       database.prepare("CREATE INDEX IF NOT EXISTS idx_connections_participant_id ON calendar_connections(participant_id)"),
       database.prepare("CREATE INDEX IF NOT EXISTS idx_email_verifications_email_created ON email_verifications(email_key, created_at)"),
+      database.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_verification_rate_scope_window ON verification_rate_limits(scope_key, window_start)"),
     ]);
 
-  const info = await database.prepare("PRAGMA table_info(participants)").all<Record<string, unknown>>();
-  const columns = new Set(info.results.map((column) => String(column.name)));
-  const additions: D1PreparedStatement[] = [];
-  if (!columns.has("email")) additions.push(database.prepare("ALTER TABLE participants ADD COLUMN email TEXT"));
-  if (!columns.has("email_key")) additions.push(database.prepare("ALTER TABLE participants ADD COLUMN email_key TEXT"));
-  if (!columns.has("email_verified_at")) additions.push(database.prepare("ALTER TABLE participants ADD COLUMN email_verified_at INTEGER"));
-  if (!columns.has("is_creator")) additions.push(database.prepare("ALTER TABLE participants ADD COLUMN is_creator INTEGER NOT NULL DEFAULT 0"));
-  if (additions.length) await database.batch(additions);
-
+  const now = Date.now();
   await database.batch([
     database.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_participants_group_email ON participants(group_id, email_key) WHERE email_key IS NOT NULL"),
     database.prepare(`UPDATE participants SET is_creator = 1
@@ -101,6 +99,10 @@ async function initializeDatabase() {
           ORDER BY first_participant.created_at ASC, first_participant.id ASC LIMIT 1
         )
       ) AND group_id NOT IN (SELECT group_id FROM participants WHERE is_creator = 1)`),
+    database.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(now),
+    database.prepare("DELETE FROM oauth_states WHERE expires_at < ?").bind(now),
+    database.prepare("DELETE FROM email_verifications WHERE expires_at < ?").bind(now),
+    database.prepare("DELETE FROM verification_rate_limits WHERE window_start < ?").bind(now - 24 * 60 * 60 * 1000),
     database.prepare("PRAGMA optimize"),
   ]);
 }
@@ -154,9 +156,29 @@ function sessionTokens(request: Request) {
   return value.length > 20 ? [value] : [];
 }
 
-export function sessionCookie(request: Request, token: string) {
-  const tokens = [...sessionTokens(request).filter((item) => item !== token), token].slice(-SESSION_LIMIT);
-  return `${SESSION_COOKIE}=${encodeURIComponent(JSON.stringify(tokens))}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=${SESSION_TTL}`;
+export async function sessionCookie(request: Request, token: string) {
+  await ensureDatabase();
+  const active = await db().prepare("SELECT group_id FROM sessions WHERE token_hash = ? AND expires_at >= ? LIMIT 1")
+    .bind(await sha256(token), Date.now()).first<Record<string, unknown>>();
+  if (!active) throw new Error("The new session could not be created.");
+  const tokens: string[] = [];
+  const replacedHashes: string[] = [];
+  for (const existingToken of sessionTokens(request)) {
+    if (existingToken === token) continue;
+    const tokenHash = await sha256(existingToken);
+    const existing = await db().prepare("SELECT group_id, expires_at FROM sessions WHERE token_hash = ? LIMIT 1")
+      .bind(tokenHash).first<Record<string, unknown>>();
+    if (existing && Number(existing.expires_at) >= Date.now() && String(existing.group_id) !== String(active.group_id)) {
+      tokens.push(existingToken);
+    } else if (existing) {
+      replacedHashes.push(tokenHash);
+    }
+  }
+  if (replacedHashes.length) {
+    await db().batch(replacedHashes.map((tokenHash) => db().prepare("DELETE FROM sessions WHERE token_hash = ?").bind(tokenHash)));
+  }
+  tokens.push(token);
+  return `${SESSION_COOKIE}=${encodeURIComponent(JSON.stringify(tokens.slice(-SESSION_LIMIT)))}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=${SESSION_TTL}`;
 }
 
 export function expiredSessionCookie() {
@@ -173,6 +195,27 @@ async function makeSession(groupId: string, participantId: string, role: "admin"
 }
 
 type VerificationPurpose = "create" | "join" | "creator" | "profile";
+const VERIFICATION_WINDOW_MS = 10 * 60 * 1000;
+
+async function incrementVerificationRates(scopes: Array<{ key: string; limit: number }>) {
+  const now = Date.now();
+  const windowStart = Math.floor(now / VERIFICATION_WINDOW_MS) * VERIFICATION_WINDOW_MS;
+  const results = await db().batch(scopes.map((scope) => db().prepare(incrementVerificationRateSql).bind(scope.key, windowStart)));
+  const exceeded = results.some((result, index) => Number((result.results?.[0] as Record<string, unknown> | undefined)?.request_count ?? 0) > scopes[index].limit);
+  if (exceeded) throw new Error("Too many verification codes were requested. Please wait 10 minutes and try again.");
+}
+
+async function enforceVerificationRequesterRate(request: Request) {
+  const clientIp = request.headers.get("cf-connecting-ip")?.trim() || null;
+  await incrementVerificationRates([
+    ...(clientIp ? [{ key: `client:${await sha256(clientIp)}`, limit: 10 }] : []),
+    { key: "deployment", limit: 200 },
+  ]);
+}
+
+async function enforceVerificationEmailRate(email: string, purpose: VerificationPurpose) {
+  await incrementVerificationRates([{ key: `email:${purpose}:${await sha256(email)}`, limit: 3 }]);
+}
 
 async function findGroup(value: string) {
   const groupLookup = cleanName(value, "Group name").toLowerCase();
@@ -202,6 +245,7 @@ export async function requestEmailVerification(request: Request, input: {
 }) {
   await ensureDatabase();
   const email = cleanEmail(input.email);
+  await enforceVerificationRequesterRate(request);
   let group: Record<string, unknown> | null = null;
   let participantId: string | null = null;
 
@@ -229,10 +273,7 @@ export async function requestEmailVerification(request: Request, input: {
     participantId = context.participantId;
   }
 
-  await db().prepare("DELETE FROM email_verifications WHERE expires_at < ?").bind(Date.now()).run();
-  const recent = await db().prepare(`SELECT COUNT(*) AS count FROM email_verifications
-    WHERE email_key = ? AND created_at > ?`).bind(email, Date.now() - 10 * 60 * 1000).first<Record<string, unknown>>();
-  if (Number(recent?.count ?? 0) >= 3) throw new Error("Too many codes were requested. Please wait 10 minutes and try again.");
+  await enforceVerificationEmailRate(email, input.purpose);
 
   const challenge = randomToken(24);
   const challengeHash = await sha256(challenge);
@@ -270,18 +311,26 @@ async function consumeEmailVerification(input: {
     || (input.participantId !== undefined && String(verification.participant_id ?? "") !== String(input.participantId ?? ""))) {
     throw new Error("That verification code is invalid or has expired.");
   }
-  if (Number(verification.expires_at) < Date.now() || Number(verification.attempts) >= 5) {
+  const now = Date.now();
+  if (Number(verification.expires_at) < now || Number(verification.attempts) >= 5) {
     await db().prepare("DELETE FROM email_verifications WHERE challenge_hash = ?").bind(challengeHash).run();
     throw new Error("That verification code is invalid or has expired.");
   }
   const expected = String(verification.code_hash);
   const supplied = await sha256(`${input.challenge}:${input.code.trim()}`);
-  if (supplied !== expected) {
-    await db().prepare("UPDATE email_verifications SET attempts = attempts + 1 WHERE challenge_hash = ?").bind(challengeHash).run();
+  if (supplied === expected) {
+    const consumed = await db().prepare(consumeVerificationSql).bind(challengeHash, supplied, now).first<Record<string, unknown>>();
+    if (!consumed) throw new Error("That verification code is invalid or has expired.");
+    return email;
+  }
+  const attempt = await db().prepare(incrementVerificationAttemptSql).bind(challengeHash, now).first<Record<string, unknown>>();
+  if (attempt) {
+    if (Number(attempt.attempts) >= 5) {
+      await db().prepare("DELETE FROM email_verifications WHERE challenge_hash = ?").bind(challengeHash).run();
+    }
     throw new Error("That verification code is incorrect.");
   }
-  await db().prepare("DELETE FROM email_verifications WHERE challenge_hash = ?").bind(challengeHash).run();
-  return email;
+  throw new Error("That verification code is invalid or has expired.");
 }
 
 export async function createGroup(input: { name: string; password: string; displayName: string; email: string; challenge: string; code: string }) {
@@ -391,8 +440,7 @@ async function sessionContexts(request: Request) {
       groupName: String(row.groupName), slug: String(row.slug), displayName: String(row.displayName),
       email: row.email ? String(row.email) : null, emailVerified: Number(row.emailVerifiedAt ?? 0) > 0,
     };
-    const existing = contexts.get(context.slug);
-    if (!existing || context.role === "admin") contexts.set(context.slug, context);
+    contexts.set(context.slug, context);
   });
   return [...contexts.values()];
 }
@@ -406,7 +454,7 @@ export async function currentContext(request: Request) {
 export async function groupSnapshot(request: Request) {
   const contexts = await sessionContexts(request);
   const requested = requestedGroup(request);
-  const context = (requested ? contexts.find((item) => item.slug === requested) : null) ?? contexts.at(-1) ?? null;
+  const context = requested ? contexts.find((item) => item.slug === requested) ?? null : contexts.at(-1) ?? null;
   if (!context) return null;
   const members = await db().prepare(`SELECT p.id, p.display_name AS displayName, p.color,
       p.email_verified_at AS emailVerifiedAt, p.is_creator AS isCreator,
@@ -484,24 +532,44 @@ async function mergeParticipantInto(groupId: string, sourceId: string, targetId:
   const source = people.results.find((person) => String(person.id) === sourceId);
   const target = people.results.find((person) => String(person.id) === targetId);
   const isCreator = Number(source?.is_creator ?? 0) === 1 || Number(target?.is_creator ?? 0) === 1;
-  const sourceConnections = await db().prepare("SELECT id, provider FROM calendar_connections WHERE participant_id = ?")
+  const sourceConnections = await db().prepare(`SELECT id, provider, account_ref, encrypted_refresh_token, created_at
+      FROM calendar_connections WHERE participant_id = ?`)
     .bind(sourceId).all<Record<string, unknown>>();
+  const targetConnections = await db().prepare(`SELECT id, provider, account_ref, encrypted_refresh_token, created_at
+      FROM calendar_connections WHERE participant_id = ?`)
+    .bind(targetId).all<Record<string, unknown>>();
+  const targetByProvider = new Map(targetConnections.results.map((connection) => [String(connection.provider), connection]));
+  const statements: D1PreparedStatement[] = [];
   for (const connection of sourceConnections.results) {
-    const existing = await db().prepare("SELECT id FROM calendar_connections WHERE participant_id = ? AND provider = ? LIMIT 1")
-      .bind(targetId, connection.provider).first<Record<string, unknown>>();
+    const existing = targetByProvider.get(String(connection.provider));
     if (existing) {
-      await db().prepare("DELETE FROM calendar_connections WHERE id = ?").bind(connection.id).run();
+      const preferSource = preferSourceConnection({
+        provider: String(connection.provider), accountRef: String(connection.account_ref),
+        encryptedRefreshToken: connection.encrypted_refresh_token ? String(connection.encrypted_refresh_token) : null,
+        createdAt: Number(connection.created_at),
+      }, {
+        provider: String(existing.provider), accountRef: String(existing.account_ref),
+        encryptedRefreshToken: existing.encrypted_refresh_token ? String(existing.encrypted_refresh_token) : null,
+        createdAt: Number(existing.created_at),
+      });
+      if (preferSource) {
+        statements.push(db().prepare("DELETE FROM calendar_connections WHERE id = ?").bind(existing.id));
+        statements.push(db().prepare("UPDATE calendar_connections SET participant_id = ? WHERE id = ?").bind(targetId, connection.id));
+      } else {
+        statements.push(db().prepare("DELETE FROM calendar_connections WHERE id = ?").bind(connection.id));
+      }
     } else {
-      await db().prepare("UPDATE calendar_connections SET participant_id = ? WHERE id = ?").bind(targetId, connection.id).run();
+      statements.push(db().prepare("UPDATE calendar_connections SET participant_id = ? WHERE id = ?").bind(targetId, connection.id));
     }
   }
-  await db().batch([
+  statements.push(
     db().prepare("UPDATE oauth_states SET participant_id = ? WHERE participant_id = ?").bind(targetId, sourceId),
     db().prepare("UPDATE sessions SET participant_id = ?, role = ? WHERE participant_id = ?").bind(targetId, isCreator ? "admin" : "member", sourceId),
     db().prepare("UPDATE participants SET is_creator = ? WHERE id = ?").bind(isCreator ? 1 : 0, targetId),
     db().prepare("DELETE FROM participants WHERE id = ? AND group_id = ?").bind(sourceId, groupId),
-  ]);
-  if (isCreator) await db().prepare("UPDATE sessions SET role = 'admin' WHERE participant_id = ?").bind(targetId).run();
+  );
+  if (isCreator) statements.push(db().prepare("UPDATE sessions SET role = 'admin' WHERE participant_id = ?").bind(targetId));
+  await db().batch(statements);
 }
 
 export async function verifyCurrentProfileEmail(request: Request, input: { email: string; challenge: string; code: string }) {
@@ -525,35 +593,25 @@ export async function verifyCurrentProfileEmail(request: Request, input: { email
   return { merged: false };
 }
 
-export async function maintainLegacyCreator(request: Request, input: { group: string; email: string; mergeDisplayName?: string }) {
-  await ensureDatabase();
-  const authorization = request.headers.get("authorization") ?? "";
-  if (!appEnv.MAINTENANCE_TOKEN || authorization !== `Bearer ${appEnv.MAINTENANCE_TOKEN}`) throw new Error("Maintenance access denied.");
-  const group = await findGroup(input.group);
-  if (!group) throw new Error("Group not found.");
-  const creator = await db().prepare("SELECT id FROM participants WHERE group_id = ? AND is_creator = 1 ORDER BY created_at ASC, id ASC LIMIT 1")
-    .bind(group.id).first<Record<string, unknown>>();
-  if (!creator) throw new Error("Creator profile not found.");
-  const email = cleanEmail(input.email);
-  await db().prepare("UPDATE participants SET email = ?, email_key = ?, is_creator = 1 WHERE id = ?")
-    .bind(email, email, creator.id).run();
-  let merged = 0;
-  if (input.mergeDisplayName?.trim()) {
-    const duplicates = await db().prepare(`SELECT id FROM participants
-      WHERE group_id = ? AND id != ? AND lower(display_name) = lower(?) ORDER BY created_at ASC`)
-      .bind(group.id, creator.id, input.mergeDisplayName.trim()).all<Record<string, unknown>>();
-    for (const duplicate of duplicates.results) {
-      await mergeParticipantInto(String(group.id), String(duplicate.id), String(creator.id));
-      merged += 1;
-    }
-  }
-  await db().prepare("UPDATE sessions SET role = 'admin' WHERE participant_id = ?").bind(creator.id).run();
-  return { slug: String(group.slug), creatorParticipantId: String(creator.id), merged };
-}
-
 export async function leaveGroup(request: Request) {
+  const context = await currentContext(request);
+  if (!context) throw new Error("Join a group before leaving it.");
+  if (context.role === "admin") throw new Error("The creator cannot leave without transferring or deleting the group.");
   const tokens = sessionTokens(request);
-  if (tokens.length) await db().batch(await Promise.all(tokens.map(async (token) => db().prepare("DELETE FROM sessions WHERE token_hash = ?").bind(await sha256(token)))));
+  const remainingTokens: string[] = [];
+  for (const token of tokens) {
+    const session = await db().prepare("SELECT group_id, expires_at FROM sessions WHERE token_hash = ? LIMIT 1")
+      .bind(await sha256(token)).first<Record<string, unknown>>();
+    if (session && Number(session.expires_at) >= Date.now() && String(session.group_id) !== context.groupId) remainingTokens.push(token);
+  }
+  await db().batch([
+    db().prepare("DELETE FROM oauth_states WHERE participant_id = ?").bind(context.participantId),
+    db().prepare("DELETE FROM calendar_connections WHERE participant_id = ?").bind(context.participantId),
+    db().prepare("DELETE FROM sessions WHERE participant_id = ?").bind(context.participantId),
+    db().prepare("DELETE FROM participants WHERE id = ? AND group_id = ?").bind(context.participantId, context.groupId),
+  ]);
+  if (!remainingTokens.length) return expiredSessionCookie();
+  return `${SESSION_COOKIE}=${encodeURIComponent(JSON.stringify(remainingTokens.slice(-SESSION_LIMIT)))}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=${SESSION_TTL}`;
 }
 
 export async function saveOAuthState(context: NonNullable<Awaited<ReturnType<typeof currentContext>>>, provider: "google" | "microsoft", redirectUri: string) {
@@ -581,7 +639,7 @@ export async function upsertConnection(input: { participantId: string; provider:
       VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(participant_id, provider) DO UPDATE SET
         account_ref = excluded.account_ref, display_name = excluded.display_name,
-        encrypted_refresh_token = excluded.encrypted_refresh_token`)
+        encrypted_refresh_token = excluded.encrypted_refresh_token, created_at = excluded.created_at`)
     .bind(crypto.randomUUID(), input.participantId, input.provider, input.accountRef, input.displayName, input.encryptedRefreshToken ?? null, Date.now()).run();
 }
 
@@ -600,4 +658,10 @@ export async function groupConnections(groupId: string) {
     accountRef: String(row.account_ref), displayName: String(row.display_name),
     encryptedRefreshToken: row.encrypted_refresh_token ? String(row.encrypted_refresh_token) : null,
   }));
+}
+
+export async function groupParticipantIds(groupId: string) {
+  await ensureDatabase();
+  const result = await db().prepare("SELECT id FROM participants WHERE group_id = ?").bind(groupId).all<Record<string, unknown>>();
+  return result.results.map((row) => String(row.id));
 }

@@ -37,7 +37,7 @@ cp .env.example .env
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). Group creation works immediately, but real calendar connections require at least one OAuth provider to be configured. The UI reports unconfigured providers instead of substituting fake calendar data.
+Open [http://localhost:3000](http://localhost:3000). Group creation and joining require Resend plus a verified sender. Real calendar connections require at least one OAuth provider. The UI reports missing configuration instead of substituting fake identity or calendar data.
 
 Generated demo calendars are available only for intentional UI testing:
 
@@ -67,7 +67,7 @@ RESEND_API_KEY=
 EMAIL_FROM="Overlap <verify@YOUR_HOST>"
 ```
 
-Codes expire after ten minutes, are stored only as hashes, allow at most five attempts, and are rate-limited per email address. Existing deployments can let legacy participants verify the profile they already use, including on the original deployment URL, before reopening it on a custom domain.
+Codes expire after ten minutes, are stored only as hashes, are single-use, allow at most five atomic attempts, and are rate-limited per purpose and email address, requester IP, and deployment. Existing deployments can let legacy participants verify the profile they already use, including on the original deployment URL, before reopening it on a custom domain.
 
 ## How calendar connections work in an open-source deployment
 
@@ -153,7 +153,7 @@ In Overlap, choose **Connect calendar → Use a self-hosted Calendar MCP** and e
 find_available_times(accountIds, duration, startDate, endDate, workingHoursOnly)
 ```
 
-Calendar MCP exposes other capabilities, but Overlap calls only `find_available_times`. Important: the upstream Calendar MCP project’s standard Google and Microsoft account flows currently include mail and contacts permissions in addition to calendars. Do not use that default configuration when your deployment promises calendar-only authorization. Use direct OAuth above, or operate a reviewed fork/configuration whose provider scopes are restricted to calendar availability.
+Calendar MCP exposes other capabilities, but Overlap calls only `find_available_times`. Important: the upstream Calendar MCP project’s default Google configuration includes Gmail and contacts scopes in addition to calendars. Its current Microsoft 365 configuration can be explicitly narrowed to `Calendars.ReadOnly`, but operators must review and set those scopes rather than relying on defaults. Use direct OAuth above, or operate a reviewed configuration whose provider scopes are restricted to calendar availability.
 
 All participants in one group should use the same connection mode. The server rejects a mix of direct OAuth and MCP connections rather than returning incomplete availability.
 
@@ -182,13 +182,28 @@ The web app is React 19 on Vinext and Cloudflare Workers. D1 stores groups, pass
 - Browser session cookies are `HttpOnly`, `Secure`, and `SameSite=Lax`.
 - Provider tokens are encrypted at rest.
 - Google uses its free/busy endpoint; Microsoft discards events marked `free` and keeps only start/end blocks in memory.
-- No email, event title, event body, guest, attachment, or contacts data is requested by the app.
+- Calendar-provider authorization never requests mailbox email, event title/body, guest, attachment, or contacts data. The separate verified email address used for group identity is stored as described below.
+
+## Stored data and deletion
+
+D1 stores group metadata, verified participant email addresses, hashed passwords and recovery keys, hashed short-lived verification/session/OAuth state, and encrypted provider refresh tokens. Resend receives the recipient address, group name, and one-time code needed to deliver verification email. Busy intervals are fetched when availability is requested and are not persisted.
+
+The group creator can remove any non-creator participant, which deletes that participant’s Overlap profile, local sessions, pending OAuth state, and stored calendar connections. A member can leave a group and remove the same local data while keeping sessions for their other groups. Removing an Overlap connection does not revoke the grant at Google or Microsoft; the calendar owner can revoke that grant in their provider account. Group deletion and creator transfer are not yet implemented, so a self-hosting operator must handle full-group deletion directly in D1 if required.
 
 Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Deployment
 
 The included `.openai/hosting.json` declares the D1 binding used by the app. Any Cloudflare Workers-compatible deployment needs a D1 database bound as `DB` plus the environment variables for the desired calendar mode.
+
+Fresh databases are bootstrapped idempotently by the application at startup. The files under `drizzle/` are the reviewed schema history. If upgrading a database created before email identity was added, apply `0002_clumsy_madame_masque.sql` and then `0003_vengeful_the_fallen.sql` through the D1 control plane before deploying the new code. Do not replay a migration whose tables or columns are already present. Production upgrades should snapshot or back up D1 first.
+
+For a Wrangler-managed deployment, replace `YOUR_D1_DATABASE` with the database name or ID:
+
+```bash
+npx wrangler d1 execute YOUR_D1_DATABASE --remote --file=drizzle/0002_clumsy_madame_masque.sql
+npx wrangler d1 execute YOUR_D1_DATABASE --remote --file=drizzle/0003_vengeful_the_fallen.sql
+```
 
 Before inviting a group, verify all of the following:
 

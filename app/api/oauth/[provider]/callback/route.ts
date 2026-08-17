@@ -3,6 +3,7 @@ import { consumeOAuthState, upsertConnection } from "../../../../../lib/server-d
 
 export async function GET(request: Request, { params }: { params: Promise<{ provider: string }> }) {
   const origin = new URL(request.url).origin;
+  let groupSlug: string | null = null;
   try {
     const { provider: rawProvider } = await params;
     if (rawProvider !== "google" && rawProvider !== "microsoft") throw new Error("Unknown calendar provider.");
@@ -12,6 +13,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ prov
     const stateToken = url.searchParams.get("state");
     if (!code || !stateToken) throw new Error("The calendar provider did not complete the connection.");
     const state = await consumeOAuthState(stateToken, provider);
+    groupSlug = state.slug;
     const encryptedRefreshToken = await exchangeCode(provider, code, state.redirectUri);
     await upsertConnection({
       participantId: state.participantId, provider, encryptedRefreshToken,
@@ -21,6 +23,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ prov
     return Response.redirect(`${origin}/?group=${encodeURIComponent(state.slug)}&connected=${provider}`);
   } catch (error) {
     const message = encodeURIComponent(error instanceof Error ? error.message : "Calendar connection failed.");
-    return Response.redirect(`${origin}/?calendar_error=${message}`);
+    const group = groupSlug ? `group=${encodeURIComponent(groupSlug)}&` : "";
+    return Response.redirect(`${origin}/?${group}calendar_error=${message}`);
   }
 }

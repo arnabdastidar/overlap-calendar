@@ -22,7 +22,7 @@ export async function POST(request: Request) {
     });
     return new Response(JSON.stringify({ slug: result.slug, adminKey: result.adminKey }), {
       status: 201,
-      headers: { "content-type": "application/json", "set-cookie": sessionCookie(request, result.token) },
+      headers: { "content-type": "application/json", "set-cookie": await sessionCookie(request, result.token) },
     });
   } catch (error) {
     return errorResponse(error);

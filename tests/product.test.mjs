@@ -59,7 +59,7 @@ test("calendar connection state stays visible in the connect modal", async () =>
   const page = await readFile(new URL("app/page.tsx", root), "utf8");
   assert.match(page, /connectedProviders\.includes\("google"\)/);
   assert.match(page, /connectedProviders\.includes\("microsoft"\)/);
-  assert.match(page, /Connected to this overlap/);
+  assert.match(page, /select to reconnect or change account/);
   assert.match(page, /✓ Connected/);
 });
 
@@ -117,8 +117,11 @@ test("group access requires a short-lived verified email code", async () => {
   assert.match(serverData, /sixDigitCode/);
   assert.match(serverData, /expires_at/);
   assert.match(serverData, /verification\.attempts\) >= 5/);
+  assert.match(serverData, /incrementVerificationRateSql/);
+  assert.match(serverData, /consumeVerificationSql/);
   assert.match(emailRoute, /purpose/);
   assert.match(emailSender, /api\.resend\.com\/emails/);
+  assert.doesNotMatch(emailSender, /EMAIL_VERIFICATION_DEBUG|debugCode/);
   assert.match(schema, /emailVerifications/);
 });
 
@@ -134,4 +137,25 @@ test("a verified email reopens the same participant and calendar profile", async
   assert.match(page, /Verify your email/);
   assert.match(page, /Email verified/);
   assert.match(profileRoute, /verifyCurrentProfileEmail/);
+});
+
+test("shared availability waits for every participant and calendars can be reconnected", async () => {
+  const [availability, page] = await Promise.all([
+    readFile(new URL("lib/availability.ts", root), "utf8"),
+    readFile(new URL("app/page.tsx", root), "utf8"),
+  ]);
+  assert.match(availability, /pendingParticipantCount/);
+  assert.match(availability, /groupParticipantIds/);
+  assert.match(page, /waits until everyone has connected/);
+  assert.doesNotMatch(page, /disabled=\{!googleAvailable \|\| googleConnected\}/);
+  assert.doesNotMatch(page, /disabled=\{!microsoftAvailable \|\| microsoftConnected\}/);
+});
+
+test("the temporary HTTP maintenance backdoor is not shipped", async () => {
+  const [serverData, envExample] = await Promise.all([
+    readFile(new URL("lib/server-data.ts", root), "utf8"),
+    readFile(new URL(".env.example", root), "utf8"),
+  ]);
+  assert.doesNotMatch(serverData, /MAINTENANCE_TOKEN|maintainLegacyCreator/);
+  assert.doesNotMatch(envExample, /MAINTENANCE_TOKEN/);
 });

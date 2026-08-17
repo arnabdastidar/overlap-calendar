@@ -71,3 +71,11 @@ export const emailVerifications = sqliteTable("email_verifications", {
 }, (table) => [
   index("idx_email_verifications_email_created").on(table.emailKey, table.createdAt),
 ]);
+
+export const verificationRateLimits = sqliteTable("verification_rate_limits", {
+  scopeKey: text("scope_key").notNull(),
+  windowStart: integer("window_start").notNull(),
+  requestCount: integer("request_count").notNull().default(0),
+}, (table) => [
+  uniqueIndex("idx_verification_rate_scope_window").on(table.scopeKey, table.windowStart),
+]);
