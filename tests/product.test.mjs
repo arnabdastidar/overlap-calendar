@@ -54,3 +54,11 @@ test("password hashing stays within the deployed runtime limit", async () => {
   assert.match(cryptoSource, /PBKDF2_ITERATIONS = 100_000/);
   assert.doesNotMatch(cryptoSource, /iterations:\s*(?:1\d{5,}|[2-9]\d{5,})/);
 });
+
+test("calendar connection state stays visible in the connect modal", async () => {
+  const page = await readFile(new URL("app/page.tsx", root), "utf8");
+  assert.match(page, /connectedProviders\.includes\("google"\)/);
+  assert.match(page, /connectedProviders\.includes\("microsoft"\)/);
+  assert.match(page, /Connected to this overlap/);
+  assert.match(page, /✓ Connected/);
+});
