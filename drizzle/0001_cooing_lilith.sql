@@ -1,0 +1,1 @@
+CREATE INDEX `idx_participants_group_id` ON `participants` (`group_id`);
