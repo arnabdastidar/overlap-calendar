@@ -23,14 +23,30 @@ test("ships the Overlap product instead of starter content", async () => {
 });
 
 test("calendar integration is scoped to availability", async () => {
-  const [mcp, providers] = await Promise.all([
+  const [mcp, providers, configRoute] = await Promise.all([
     readFile(new URL("lib/calendar-mcp.ts", root), "utf8"),
     readFile(new URL("lib/calendar-providers.ts", root), "utf8"),
+    readFile(new URL("app/api/calendars/config/route.ts", root), "utf8"),
   ]);
   assert.match(mcp, /find_available_times/);
   assert.doesNotMatch(mcp, /get_emails|send_email|contacts/);
   assert.match(providers, /calendar\.freebusy/);
   assert.match(providers, /Calendars\.Read/);
+  assert.match(providers, /@odata\.nextLink/);
+  assert.match(configRoute, /providerReady\("google"\)/);
+  assert.match(configRoute, /providerReady\("microsoft"\)/);
+});
+
+test("demo calendars are explicit and never a silent production fallback", async () => {
+  const [connectRoute, availability, envExample] = await Promise.all([
+    readFile(new URL("app/api/calendars/connect/route.ts", root), "utf8"),
+    readFile(new URL("lib/availability.ts", root), "utf8"),
+    readFile(new URL(".env.example", root), "utf8"),
+  ]);
+  assert.match(connectRoute, /if \(!demoCalendarsEnabled\(\)\)/);
+  assert.match(connectRoute, /not configured on this deployment yet/);
+  assert.match(availability, /demoEnabled && isDemoConnection\(connection\)/);
+  assert.match(envExample, /ENABLE_DEMO_CALENDARS=false/);
 });
 
 test("password hashing stays within the deployed runtime limit", async () => {

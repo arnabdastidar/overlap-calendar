@@ -2,12 +2,13 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
-type Member = { id: string; displayName: string; color: string; provider: string | null; calendarName: string | null };
+type Member = { id: string; displayName: string; color: string; provider: string | null; calendarName: string | null; isDemo: boolean };
 type Group = {
   groupName: string; slug: string; displayName: string; role: "admin" | "member";
   participantId: string; members: Member[];
 };
 type Slot = { start: string; end: string };
+type CalendarConfig = { google: boolean; microsoft: boolean; mcp: boolean; demo: boolean };
 type Modal = "create" | "join" | "recover" | "connect" | "share" | "settings" | "people" | null;
 
 const durations = Array.from({ length: 10 }, (_, index) => (index + 1) * 30);
@@ -51,6 +52,7 @@ export default function Home() {
   const [toast, setToast] = useState("");
   const [formError, setFormError] = useState("");
   const [recoveryKey, setRecoveryKey] = useState("");
+  const [calendarConfig, setCalendarConfig] = useState<CalendarConfig>({ google: false, microsoft: false, mcp: false, demo: false });
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 
   const showToast = useCallback((message: string) => {
@@ -95,6 +97,7 @@ export default function Home() {
       if (connected) showToast(`${connected === "google" ? "Google" : "Microsoft"} Calendar connected`);
       if (calendarError) showToast(calendarError);
       if (connected || calendarError) window.history.replaceState({}, "", "/");
+      void jsonRequest("/api/calendars/config", "GET").then(setCalendarConfig).catch(() => undefined);
       loadGroup().then((activeGroup) => {
         if (!activeGroup && params.get("group")) setModal("join");
       });
@@ -112,12 +115,17 @@ export default function Home() {
     if (!group) return [];
     const map = new Map<string, Member & { providers: string[] }>();
     group.members.forEach((member) => {
+      const providerIsReady = member.provider === "google" ? calendarConfig.google
+        : member.provider === "microsoft" ? calendarConfig.microsoft
+        : member.provider === "mcp" ? calendarConfig.mcp
+        : false;
+      const provider = member.isDemo ? (calendarConfig.demo ? member.provider : null) : (providerIsReady ? member.provider : null);
       const existing = map.get(member.id);
-      if (existing && member.provider) existing.providers.push(member.provider);
-      else map.set(member.id, { ...member, providers: member.provider ? [member.provider] : [] });
+      if (existing && provider) existing.providers.push(provider);
+      else map.set(member.id, { ...member, providers: provider ? [provider] : [] });
     });
     return [...map.values()];
-  }, [group]);
+  }, [calendarConfig, group]);
 
   const connectedCount = uniqueMembers.filter((member) => member.providers.length).length;
   const groupedSlots = useMemo(() => {
@@ -162,7 +170,9 @@ export default function Home() {
       }
       setModal(null);
       await loadGroup();
-      showToast(`${provider === "google" ? "Google" : "Microsoft"} Calendar connected${result.mode === "demo" ? " in demo mode" : ""}`);
+      showToast(result.mode === "demo"
+        ? `${provider === "google" ? "Google" : "Microsoft"} demo calendar connected — no real calendar data is being used`
+        : `${provider === "google" ? "Google" : "Microsoft"} Calendar connected`);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Could not connect the calendar.");
     }
@@ -325,7 +335,7 @@ export default function Home() {
         </section>
       </section>
 
-      {modal === "connect" && <ConnectModal error={formError} onClose={() => { setModal(null); setFormError(""); }} onConnect={connect} onConnectMcp={connectMcp} />}
+      {modal === "connect" && <ConnectModal config={calendarConfig} error={formError} onClose={() => { setModal(null); setFormError(""); }} onConnect={connect} onConnectMcp={connectMcp} />}
       {modal === "share" && <ShareModal group={group} shareUrl={shareUrl} recoveryKey={recoveryKey} onCopy={copy} onClose={() => setModal(null)} />}
       {modal === "settings" && <SettingsModal group={group} error={formError} recoveryKey={recoveryKey} onClose={() => { setModal(null); setFormError(""); }} onSubmit={updateSettings} />}
       {modal === "people" && <PeopleModal members={uniqueMembers} onClose={() => setModal(null)} />}
@@ -350,8 +360,11 @@ function AuthModal({ mode, sharedGroup, error, onClose, onSubmit, onMode }: { mo
   </form><div className="modal-switch">{mode === "create" ? <>Already have a group? <button onClick={() => onMode("join")}>Join it</button></> : mode === "recover" ? <>Have the password? <button onClick={() => onMode("join")}>Join normally</button></> : <>Creating something new? <button onClick={() => onMode("create")}>Create a group</button><small>or</small><button onClick={() => onMode("recover")}>I’m the creator</button></>}</div></ModalShell>;
 }
 
-function ConnectModal({ error, onClose, onConnect, onConnectMcp }: { error: string; onClose: () => void; onConnect: (provider: "google" | "microsoft") => void; onConnectMcp: (event: FormEvent<HTMLFormElement>) => void }) {
-  return <ModalShell onClose={onClose}><span className="modal-kicker">YOUR CALENDAR</span><h2>Connect securely</h2><p>Overlap requests read-only free/busy access. We never need your event names, notes, or guests.</p><div className="provider-buttons"><button onClick={() => onConnect("google")}><span className="google-g">G</span><div><strong>Google Calendar</strong><small>Personal or Workspace</small></div><b>→</b></button><button onClick={() => onConnect("microsoft")}><span className="microsoft-mark"><i /><i /><i /><i /></span><div><strong>Microsoft Outlook</strong><small>Personal or Microsoft 365</small></div><b>→</b></button></div><details className="mcp-connect"><summary>Use a self-hosted Calendar MCP</summary><form onSubmit={onConnectMcp}><input name="accountId" placeholder="MCP account ID" required /><button type="submit">Connect MCP</button></form></details>{error && <div className="form-error">{error}</div>}<div className="privacy-box"><span>♢</span><p><strong>Your schedule stays yours</strong><small>Only blocks of busy time are compared. Event content is never saved.</small></p></div></ModalShell>;
+function ConnectModal({ config, error, onClose, onConnect, onConnectMcp }: { config: CalendarConfig; error: string; onClose: () => void; onConnect: (provider: "google" | "microsoft") => void; onConnectMcp: (event: FormEvent<HTMLFormElement>) => void }) {
+  const googleAvailable = config.google || config.demo;
+  const microsoftAvailable = config.microsoft || config.demo;
+  const noProvider = !googleAvailable && !microsoftAvailable && !config.mcp;
+  return <ModalShell onClose={onClose}><span className="modal-kicker">YOUR CALENDAR</span><h2>Connect securely</h2><p>Overlap requests calendar-only access. We never request email, event notes, or contacts.</p><div className="provider-buttons"><button disabled={!googleAvailable} onClick={() => onConnect("google")}><span className="google-g">G</span><div><strong>Google Calendar</strong><small>{config.google ? "Free/busy access · Personal or Workspace" : config.demo ? "Demo data only · no calendar access" : "Not configured by this deployment"}</small></div><b>{googleAvailable ? "→" : "—"}</b></button><button disabled={!microsoftAvailable} onClick={() => onConnect("microsoft")}><span className="microsoft-mark"><i /><i /><i /><i /></span><div><strong>Microsoft Outlook</strong><small>{config.microsoft ? "Read-only access · Personal or Microsoft 365" : config.demo ? "Demo data only · no calendar access" : "Not configured by this deployment"}</small></div><b>{microsoftAvailable ? "→" : "—"}</b></button></div>{config.mcp && <details className="mcp-connect"><summary>Use an admin-provisioned Calendar MCP account</summary><p>The MCP administrator must authenticate your account first.</p><form onSubmit={onConnectMcp}><input name="accountId" placeholder="MCP account ID" required /><button type="submit">Connect MCP</button></form></details>}{noProvider && <div className="provider-setup-note"><strong>Calendar access is not configured</strong><span>The deployment owner must add Google or Microsoft OAuth credentials before anyone can connect a real calendar.</span></div>}{config.demo && <div className="demo-warning">Demo calendars are enabled. They use generated busy blocks, not provider data.</div>}{error && <div className="form-error">{error}</div>}<div className="privacy-box"><span>♢</span><p><strong>Your schedule stays yours</strong><small>Only busy time blocks are compared. Event content is never saved.</small></p></div></ModalShell>;
 }
 
 function ShareModal({ group, shareUrl, recoveryKey, onCopy, onClose }: { group: Group; shareUrl: string; recoveryKey: string; onCopy: (value: string, message: string) => void; onClose: () => void }) {

@@ -12,6 +12,7 @@ type AppEnv = {
   TOKEN_ENCRYPTION_KEY?: string;
   CALENDAR_MCP_URL?: string;
   CALENDAR_MCP_API_KEY?: string;
+  ENABLE_DEMO_CALENDARS?: string;
 };
 
 export const appEnv = env as unknown as AppEnv;
@@ -181,7 +182,7 @@ export async function groupSnapshot(request: Request) {
   const context = await currentContext(request);
   if (!context) return null;
   const members = await db().prepare(`SELECT p.id, p.display_name AS displayName, p.color,
-      c.provider, c.display_name AS calendarName
+      c.provider, c.display_name AS calendarName, c.account_ref AS accountRef
     FROM participants p LEFT JOIN calendar_connections c ON c.participant_id = p.id
     WHERE p.group_id = ? ORDER BY p.created_at ASC`)
     .bind(context.groupId).all<Record<string, unknown>>();
@@ -189,6 +190,8 @@ export async function groupSnapshot(request: Request) {
     id: String(member.id), displayName: String(member.displayName), color: String(member.color),
     provider: member.provider ? String(member.provider) : null,
     calendarName: member.calendarName ? String(member.calendarName) : null,
+    isDemo: (member.provider === "google" || member.provider === "microsoft")
+      && Boolean(member.accountRef && String(member.accountRef).startsWith("demo:")),
   })) };
 }
 
@@ -246,6 +249,12 @@ export async function upsertConnection(input: { participantId: string; provider:
         account_ref = excluded.account_ref, display_name = excluded.display_name,
         encrypted_refresh_token = excluded.encrypted_refresh_token`)
     .bind(crypto.randomUUID(), input.participantId, input.provider, input.accountRef, input.displayName, input.encryptedRefreshToken ?? null, Date.now()).run();
+}
+
+export async function updateConnectionRefreshToken(connectionId: string, encryptedRefreshToken: string) {
+  await ensureDatabase();
+  await db().prepare("UPDATE calendar_connections SET encrypted_refresh_token = ? WHERE id = ?")
+    .bind(encryptedRefreshToken, connectionId).run();
 }
 
 export async function groupConnections(groupId: string) {

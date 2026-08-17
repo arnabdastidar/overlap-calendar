@@ -12,8 +12,8 @@ Overlap is a privacy-first group availability portal for Google Calendar and Mic
 - Uses a group name and password for members
 - Gives the creator a separate recovery key and settings access
 - Connects Google Calendar and Microsoft Outlook with read-only calendar scopes
-- Supports the open-source [MarimerLLC/calendar-mcp](https://github.com/MarimerLLC/calendar-mcp) HTTP server
-- Calls only `find_available_times` on Calendar MCP — no email or contacts tools
+- Supports direct, self-service OAuth for Google Calendar and Microsoft Outlook
+- Optionally supports an admin-provisioned [MarimerLLC/calendar-mcp](https://github.com/MarimerLLC/calendar-mcp) HTTP server
 - Shows only the shared free times; event titles and descriptions are never stored
 - Calculates 30-minute through 5-hour openings across six months
 
@@ -35,7 +35,15 @@ cp .env.example .env
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). Without OAuth or MCP settings, calendar connections use deterministic demo busy blocks so the complete group flow works immediately.
+Open [http://localhost:3000](http://localhost:3000). Group creation works immediately, but real calendar connections require at least one OAuth provider to be configured. The UI reports unconfigured providers instead of substituting fake calendar data.
+
+Generated demo calendars are available only for intentional UI testing:
+
+```dotenv
+ENABLE_DEMO_CALENDARS=true
+```
+
+Do not enable demo calendars on a shared deployment.
 
 Useful commands:
 
@@ -46,9 +54,58 @@ npm run build
 npm run db:generate
 ```
 
+## How open-source deployments work
+
+The repository contains the application code, not reusable Google or Microsoft secrets. Every person or organization hosting Overlap creates its own OAuth applications and stores those credentials in its deployment environment. Those values must never be committed to GitHub.
+
+When a participant clicks a provider button:
+
+1. Overlap redirects them to Google or Microsoft.
+2. The provider shows the calendar-only permission request.
+3. The provider sends an authorization code back to that Overlap deployment.
+4. Overlap encrypts the returned refresh token before storing it.
+5. Availability checks request busy intervals and intersect them in memory. They do not save event content.
+
+This is the same operating model used by most self-hosted OAuth applications: source code is shared, while every deployment owns its domains, OAuth consent configuration, and secrets.
+
 ## Calendar connection modes
 
-### Calendar MCP
+### Direct Google or Microsoft OAuth (recommended)
+
+Direct OAuth is the default for a self-service portal where every group member connects their own account.
+
+Google requests only the [`calendar.freebusy`](https://developers.google.com/workspace/calendar/api/auth) scope:
+
+```text
+https://www.googleapis.com/auth/calendar.freebusy
+```
+
+Microsoft requests only:
+
+```text
+offline_access Calendars.Read
+```
+
+Create web OAuth applications with these exact callbacks:
+
+```text
+https://YOUR_HOST/api/oauth/google/callback
+https://YOUR_HOST/api/oauth/microsoft/callback
+```
+
+Then set deployment secrets:
+
+```dotenv
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+MICROSOFT_CLIENT_ID=
+MICROSOFT_CLIENT_SECRET=
+TOKEN_ENCRYPTION_KEY=
+```
+
+`TOKEN_ENCRYPTION_KEY` should contain at least 32 random bytes. Refresh tokens are encrypted with AES-GCM before storage. See Google’s [web-server OAuth guide](https://developers.google.com/identity/protocols/oauth2/web-server) and Microsoft’s [delegated OAuth guide](https://learn.microsoft.com/en-us/graph/auth-v2-user) for provider setup.
+
+### Calendar MCP (optional, admin-managed)
 
 Overlap includes a Streamable HTTP MCP client for [MarimerLLC/calendar-mcp](https://github.com/MarimerLLC/calendar-mcp), an MIT-licensed server supporting Google Workspace, Microsoft 365, and Outlook.com.
 
@@ -61,7 +118,7 @@ docker build -t calendar-mcp-http .
 docker run -p 8080:8080 -v calendar-mcp-data:/app/data calendar-mcp-http
 ```
 
-Use its admin UI at `http://localhost:8080/admin/ui` to add and authenticate calendar accounts. Then configure Overlap:
+Use its admin UI at `http://localhost:8080/admin/ui` to add and authenticate calendar accounts. Calendar MCP account IDs are provisioned by its administrator; it is not a participant-driven browser OAuth flow. Then configure Overlap:
 
 ```dotenv
 CALENDAR_MCP_URL=http://localhost:8080
@@ -74,42 +131,9 @@ In Overlap, choose **Connect calendar → Use a self-hosted Calendar MCP** and e
 find_available_times(accountIds, duration, startDate, endDate, workingHoursOnly)
 ```
 
-Calendar MCP exposes other capabilities, but Overlap intentionally does not call them.
+Calendar MCP exposes other capabilities, but Overlap calls only `find_available_times`. Important: the upstream Calendar MCP project’s standard Google and Microsoft account flows currently include mail and contacts permissions in addition to calendars. Do not use that default configuration when your deployment promises calendar-only authorization. Use direct OAuth above, or operate a reviewed fork/configuration whose provider scopes are restricted to calendar availability.
 
-### Direct Google or Microsoft OAuth
-
-Direct OAuth is included for a simple browser experience where every group member connects their own account.
-
-Google requests only:
-
-```text
-https://www.googleapis.com/auth/calendar.freebusy
-```
-
-Microsoft requests only:
-
-```text
-offline_access Calendars.Read
-```
-
-Create OAuth apps with these callbacks:
-
-```text
-https://YOUR_HOST/api/oauth/google/callback
-https://YOUR_HOST/api/oauth/microsoft/callback
-```
-
-Then set:
-
-```dotenv
-GOOGLE_CLIENT_ID=
-GOOGLE_CLIENT_SECRET=
-MICROSOFT_CLIENT_ID=
-MICROSOFT_CLIENT_SECRET=
-TOKEN_ENCRYPTION_KEY=
-```
-
-`TOKEN_ENCRYPTION_KEY` should be at least 32 random bytes. Refresh tokens are encrypted with AES-GCM before they are stored.
+All participants in one group should use the same connection mode. The server rejects a mix of direct OAuth and MCP connections rather than returning incomplete availability.
 
 ## Architecture
 
@@ -142,6 +166,15 @@ Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.m
 ## Deployment
 
 The included `.openai/hosting.json` declares the D1 binding used by the app. Any Cloudflare Workers-compatible deployment needs a D1 database bound as `DB` plus the environment variables for the desired calendar mode.
+
+Before inviting a group, verify all of the following:
+
+- The site is reachable by every intended participant, not restricted to the deployment owner.
+- At least one direct OAuth provider reports as configured in the connection dialog.
+- The registered OAuth callback exactly matches the deployed HTTPS origin.
+- `TOKEN_ENCRYPTION_KEY` is set as a secret and is stable across deployments.
+- `ENABLE_DEMO_CALENDARS` is absent or `false`.
+- A full create → join → provider consent → availability flow has been tested with two separate browser sessions.
 
 ## Contributing
 

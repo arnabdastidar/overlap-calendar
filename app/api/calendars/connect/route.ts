@@ -1,4 +1,4 @@
-import { authorizationUrl, providerReady } from "../../../../lib/calendar-providers";
+import { authorizationUrl, demoCalendarsEnabled, providerReady } from "../../../../lib/calendar-providers";
 import { appEnv, currentContext, saveOAuthState, upsertConnection } from "../../../../lib/server-data";
 
 export async function POST(request: Request) {
@@ -19,6 +19,10 @@ export async function POST(request: Request) {
       const redirectUri = `${new URL(request.url).origin}/api/oauth/${body.provider}/callback`;
       const state = await saveOAuthState(context, body.provider, redirectUri);
       return Response.json({ authorizationUrl: authorizationUrl(body.provider, state, redirectUri), mode: "oauth" });
+    }
+    if (!demoCalendarsEnabled()) {
+      const name = body.provider === "google" ? "Google Calendar" : "Microsoft Outlook";
+      return Response.json({ error: `${name} is not configured on this deployment yet.` }, { status: 503 });
     }
     await upsertConnection({
       participantId: context.participantId, provider: body.provider,

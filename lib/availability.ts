@@ -1,8 +1,13 @@
-import { readBusyTimes } from "./calendar-providers";
+import { demoCalendarsEnabled, providerReady, readBusyTimes } from "./calendar-providers";
 import { findTimesWithMcp } from "./calendar-mcp";
-import { appEnv, groupConnections } from "./server-data";
+import { appEnv, groupConnections, updateConnectionRefreshToken } from "./server-data";
 
 type Interval = { start: string; end: string };
+
+function isDemoConnection(connection: { provider: string; accountRef: string }) {
+  return (connection.provider === "google" || connection.provider === "microsoft")
+    && connection.accountRef.startsWith("demo:");
+}
 
 function timezoneParts(date: Date, timezone: string) {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -52,7 +57,12 @@ export async function findGroupAvailability(groupId: string, duration: number, d
   try { new Intl.DateTimeFormat("en", { timeZone: timezone }).format(); }
   catch { throw new Error("Choose a valid time zone."); }
 
-  const connections = await groupConnections(groupId);
+  const demoEnabled = demoCalendarsEnabled();
+  const connections = (await groupConnections(groupId)).filter((connection) => {
+    if (isDemoConnection(connection)) return demoEnabled;
+    if (connection.provider === "mcp") return Boolean(appEnv.CALENDAR_MCP_URL);
+    return providerReady(connection.provider);
+  });
   if (!connections.length) return { slots: [], connectionCount: 0, source: "none" };
   const start = new Date();
   const end = new Date(start.getTime() + days * 24 * 60 * 60 * 1000);
@@ -61,12 +71,24 @@ export async function findGroupAvailability(groupId: string, duration: number, d
     const slots = await findTimesWithMcp(mcpConnections.map((item) => item.accountRef), duration, start.toISOString(), end.toISOString());
     return { slots: slots.slice(0, 40), connectionCount: connections.length, source: "mcp" };
   }
+  if (mcpConnections.length) {
+    throw new Error("This group mixes direct OAuth and Calendar MCP connections. Use one connection mode for everyone in the group.");
+  }
 
   const busyByConnection = await Promise.all(connections.map(async (connection) => {
     if ((connection.provider === "google" || connection.provider === "microsoft") && connection.encryptedRefreshToken) {
-      return readBusyTimes(connection.provider, connection.encryptedRefreshToken, start.toISOString(), end.toISOString());
+      return readBusyTimes(
+        connection.provider,
+        connection.encryptedRefreshToken,
+        start.toISOString(),
+        end.toISOString(),
+        (encryptedRefreshToken) => updateConnectionRefreshToken(connection.id, encryptedRefreshToken),
+      );
     }
-    return demoBusy(connection.id, days, timezone);
+    if (demoEnabled && isDemoConnection(connection)) {
+      return demoBusy(connection.id, days, timezone);
+    }
+    throw new Error(`${connection.displayName} needs to be reconnected before availability can be calculated.`);
   }));
   const busy = busyByConnection.flat();
   const today = timezoneParts(start, timezone);
@@ -84,5 +106,5 @@ export async function findGroupAvailability(groupId: string, duration: number, d
       slots.push({ start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString() });
     }
   }
-  return { slots, connectionCount: connections.length, source: connections.some((item) => item.encryptedRefreshToken) ? "provider" : "demo" };
+  return { slots, connectionCount: connections.length, source: connections.every(isDemoConnection) ? "demo" : "provider" };
 }

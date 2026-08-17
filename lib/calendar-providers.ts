@@ -11,6 +11,10 @@ export function providerReady(provider: OAuthProvider) {
   return Boolean(configured && appEnv.TOKEN_ENCRYPTION_KEY);
 }
 
+export function demoCalendarsEnabled() {
+  return appEnv.ENABLE_DEMO_CALENDARS?.toLowerCase() === "true";
+}
+
 export function authorizationUrl(provider: OAuthProvider, state: string, redirectUri: string) {
   if (provider === "google") {
     const params = new URLSearchParams({
@@ -66,14 +70,18 @@ async function accessToken(provider: OAuthProvider, encryptedRefreshToken: strin
         client_id: appEnv.MICROSOFT_CLIENT_ID ?? "", client_secret: appEnv.MICROSOFT_CLIENT_SECRET ?? "",
         scope: "offline_access Calendars.Read",
       });
-  return data.access_token as string;
+  return {
+    value: data.access_token as string,
+    rotatedRefreshToken: data.refresh_token ? await encryptSecret(data.refresh_token, appEnv.TOKEN_ENCRYPTION_KEY) : null,
+  };
 }
 
-export async function readBusyTimes(provider: OAuthProvider, encryptedRefreshToken: string, start: string, end: string): Promise<BusyInterval[]> {
+export async function readBusyTimes(provider: OAuthProvider, encryptedRefreshToken: string, start: string, end: string, onRefreshToken?: (encryptedRefreshToken: string) => Promise<void>): Promise<BusyInterval[]> {
   const token = await accessToken(provider, encryptedRefreshToken);
+  if (token.rotatedRefreshToken && onRefreshToken) await onRefreshToken(token.rotatedRefreshToken);
   if (provider === "google") {
     const response = await fetch("https://www.googleapis.com/calendar/v3/freeBusy", {
-      method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      method: "POST", headers: { authorization: `Bearer ${token.value}`, "content-type": "application/json" },
       body: JSON.stringify({ timeMin: start, timeMax: end, items: [{ id: "primary" }] }),
     });
     const data = await response.json() as { calendars?: Record<string, { busy?: BusyInterval[] }>; error?: { message?: string } };
@@ -86,11 +94,21 @@ export async function readBusyTimes(provider: OAuthProvider, encryptedRefreshTok
   url.searchParams.set("endDateTime", end);
   url.searchParams.set("$select", "start,end,showAs");
   url.searchParams.set("$top", "1000");
-  const response = await fetch(url, { headers: { authorization: `Bearer ${token}`, prefer: 'outlook.timezone="UTC"' } });
-  const data = await response.json() as { value?: Array<{ start: { dateTime: string }; end: { dateTime: string }; showAs?: string }>; error?: { message?: string } };
-  if (!response.ok) throw new Error(data.error?.message ?? "Microsoft Calendar could not be read.");
-  return (data.value ?? []).filter((event) => event.showAs !== "free").map((event) => ({
-    start: event.start.dateTime.endsWith("Z") ? event.start.dateTime : `${event.start.dateTime}Z`,
-    end: event.end.dateTime.endsWith("Z") ? event.end.dateTime : `${event.end.dateTime}Z`,
-  }));
+  const busy: BusyInterval[] = [];
+  let nextUrl: string | null = url.toString();
+  while (nextUrl) {
+    const response = await fetch(nextUrl, { headers: { authorization: `Bearer ${token.value}`, prefer: 'outlook.timezone="UTC"' } });
+    const data = await response.json() as {
+      value?: Array<{ start: { dateTime: string }; end: { dateTime: string }; showAs?: string }>;
+      error?: { message?: string };
+      "@odata.nextLink"?: string;
+    };
+    if (!response.ok) throw new Error(data.error?.message ?? "Microsoft Calendar could not be read.");
+    busy.push(...(data.value ?? []).filter((event) => event.showAs !== "free").map((event) => ({
+      start: event.start.dateTime.endsWith("Z") ? event.start.dateTime : `${event.start.dateTime}Z`,
+      end: event.end.dateTime.endsWith("Z") ? event.end.dateTime : `${event.end.dateTime}Z`,
+    })));
+    nextUrl = data["@odata.nextLink"] ?? null;
+  }
+  return busy;
 }
