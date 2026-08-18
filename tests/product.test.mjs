@@ -106,6 +106,26 @@ test("only creators can remove another participant", async () => {
   assert.match(page, /group\.role === "admin"/);
 });
 
+test("creators can assign participant emails and send rate-limited calendar reminders", async () => {
+  const [page, serverData, memberRoute, emailSender] = await Promise.all([
+    readFile(new URL("app/page.tsx", root), "utf8"),
+    readFile(new URL("lib/server-data.ts", root), "utf8"),
+    readFile(new URL("app/api/groups/members/[participantId]/route.ts", root), "utf8"),
+    readFile(new URL("lib/email.ts", root), "utf8"),
+  ]);
+  assert.match(serverData, /assignGroupMemberEmail/);
+  assert.match(serverData, /Only the group creator can add participant emails/);
+  assert.match(serverData, /DELETE FROM email_verifications/);
+  assert.match(serverData, /reminder:participant/);
+  assert.match(serverData, /already connected a calendar/);
+  assert.match(memberRoute, /export async function PUT/);
+  assert.match(memberRoute, /export async function POST/);
+  assert.match(emailSender, /sendCalendarReminderEmail/);
+  assert.match(emailSender, /shared group password/);
+  assert.match(page, /Send reminder/);
+  assert.match(page, /Add participant emails/);
+});
+
 test("group access requires a short-lived verified email code", async () => {
   const [serverData, emailRoute, emailSender, schema] = await Promise.all([
     readFile(new URL("lib/server-data.ts", root), "utf8"),
@@ -139,14 +159,17 @@ test("a verified email reopens the same participant and calendar profile", async
   assert.match(profileRoute, /verifyCurrentProfileEmail/);
 });
 
-test("shared availability waits for every participant and calendars can be reconnected", async () => {
+test("partial availability names missing participants and calendars can be reconnected", async () => {
   const [availability, page] = await Promise.all([
     readFile(new URL("lib/availability.ts", root), "utf8"),
     readFile(new URL("app/page.tsx", root), "utf8"),
   ]);
   assert.match(availability, /pendingParticipantCount/);
   assert.match(availability, /groupParticipantIds/);
-  assert.match(page, /waits until everyone has connected/);
+  assert.doesNotMatch(availability, /if \(pendingParticipantCount\)/);
+  assert.match(page, /availability is not yet accounted for/);
+  assert.match(page, /availabilities are not yet accounted for/);
+  assert.match(page, /based on \{connectedCount\} of \{uniqueMembers\.length\}/);
   assert.doesNotMatch(page, /disabled=\{!googleAvailable \|\| googleConnected\}/);
   assert.doesNotMatch(page, /disabled=\{!microsoftAvailable \|\| microsoftConnected\}/);
 });

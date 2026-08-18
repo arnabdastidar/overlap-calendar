@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { hashPassword, randomToken, sha256, verifyPassword } from "./crypto";
-import { sendVerificationEmail } from "./email";
-import { preferSourceConnection } from "./identity-policy";
+import { sendCalendarReminderEmail, sendVerificationEmail } from "./email";
+import { canAssignMemberEmail, preferSourceConnection } from "./identity-policy";
 import { consumeVerificationSql, incrementVerificationAttemptSql, incrementVerificationRateSql } from "./verification-queries";
 
 export type Provider = "google" | "microsoft" | "mcp";
@@ -197,24 +197,26 @@ async function makeSession(groupId: string, participantId: string, role: "admin"
 type VerificationPurpose = "create" | "join" | "creator" | "profile";
 const VERIFICATION_WINDOW_MS = 10 * 60 * 1000;
 
-async function incrementVerificationRates(scopes: Array<{ key: string; limit: number }>) {
+async function incrementRateCounters(scopes: Array<{ key: string; limit: number }>, windowMs: number) {
   const now = Date.now();
-  const windowStart = Math.floor(now / VERIFICATION_WINDOW_MS) * VERIFICATION_WINDOW_MS;
+  const windowStart = Math.floor(now / windowMs) * windowMs;
   const results = await db().batch(scopes.map((scope) => db().prepare(incrementVerificationRateSql).bind(scope.key, windowStart)));
-  const exceeded = results.some((result, index) => Number((result.results?.[0] as Record<string, unknown> | undefined)?.request_count ?? 0) > scopes[index].limit);
+  const counts = results.map((result) => Number((result.results?.[0] as Record<string, unknown> | undefined)?.request_count ?? 0));
+  const exceeded = counts.some((count, index) => count > scopes[index].limit);
   if (exceeded) throw new Error("Too many verification codes were requested. Please wait 10 minutes and try again.");
+  return { counts, windowStart };
 }
 
 async function enforceVerificationRequesterRate(request: Request) {
   const clientIp = request.headers.get("cf-connecting-ip")?.trim() || null;
-  await incrementVerificationRates([
+  await incrementRateCounters([
     ...(clientIp ? [{ key: `client:${await sha256(clientIp)}`, limit: 10 }] : []),
     { key: "deployment", limit: 200 },
-  ]);
+  ], VERIFICATION_WINDOW_MS);
 }
 
 async function enforceVerificationEmailRate(email: string, purpose: VerificationPurpose) {
-  await incrementVerificationRates([{ key: `email:${purpose}:${await sha256(email)}`, limit: 3 }]);
+  await incrementRateCounters([{ key: `email:${purpose}:${await sha256(email)}`, limit: 3 }], VERIFICATION_WINDOW_MS);
 }
 
 async function findGroup(value: string) {
@@ -456,7 +458,7 @@ export async function groupSnapshot(request: Request) {
   const requested = requestedGroup(request);
   const context = requested ? contexts.find((item) => item.slug === requested) ?? null : contexts.at(-1) ?? null;
   if (!context) return null;
-  const members = await db().prepare(`SELECT p.id, p.display_name AS displayName, p.color,
+  const members = await db().prepare(`SELECT p.id, p.display_name AS displayName, p.color, p.email,
       p.email_verified_at AS emailVerifiedAt, p.is_creator AS isCreator,
       c.provider, c.display_name AS calendarName, c.account_ref AS accountRef
     FROM participants p LEFT JOIN calendar_connections c ON c.participant_id = p.id
@@ -466,6 +468,7 @@ export async function groupSnapshot(request: Request) {
     groupName: item.groupName, slug: item.slug, role: item.role, participantId: item.participantId,
   })), members: members.results.map((member) => ({
     id: String(member.id), displayName: String(member.displayName), color: String(member.color),
+    email: context.role === "admin" && member.email ? String(member.email) : null,
     emailVerified: Number(member.emailVerifiedAt ?? 0) > 0, isCreator: Number(member.isCreator ?? 0) === 1,
     provider: member.provider ? String(member.provider) : null,
     calendarName: member.calendarName ? String(member.calendarName) : null,
@@ -522,6 +525,73 @@ export async function removeGroupMember(request: Request, participantId: string)
     db().prepare("DELETE FROM sessions WHERE participant_id = ?").bind(participantId),
     db().prepare("DELETE FROM participants WHERE id = ? AND group_id = ?").bind(participantId, context.groupId),
   ]);
+}
+
+export async function assignGroupMemberEmail(request: Request, participantId: string, value: string) {
+  const context = await currentContext(request);
+  if (!context || context.role !== "admin") throw new Error("Only the group creator can add participant emails.");
+  const email = cleanEmail(value);
+  const participant = await db().prepare(`SELECT id, email_key, email_verified_at, is_creator
+      FROM participants WHERE id = ? AND group_id = ? LIMIT 1`)
+    .bind(participantId, context.groupId).first<Record<string, unknown>>();
+  if (!participant) throw new Error("That person is no longer in this group.");
+  if (Number(participant.is_creator) === 1) throw new Error("The creator manages their own verified email.");
+  const currentEmail = participant.email_key ? String(participant.email_key) : null;
+  const verifiedAt = participant.email_verified_at ? Number(participant.email_verified_at) : null;
+  if (!canAssignMemberEmail(currentEmail, verifiedAt, email)) {
+    throw new Error("A verified participant must change their own email.");
+  }
+  const existing = await db().prepare("SELECT id FROM participants WHERE group_id = ? AND email_key = ? AND id != ? LIMIT 1")
+    .bind(context.groupId, email, participantId).first<Record<string, unknown>>();
+  if (existing) throw new Error("That email already belongs to another person in this group.");
+  try {
+    const statements: D1PreparedStatement[] = [];
+    if (currentEmail && currentEmail !== email) {
+      statements.push(db().prepare(`DELETE FROM email_verifications
+        WHERE group_id = ? AND email_key = ? AND purpose IN ('join', 'profile')`).bind(context.groupId, currentEmail));
+    }
+    statements.push(db().prepare(`UPDATE participants SET email = ?, email_key = ?,
+        email_verified_at = CASE WHEN email_key = ? THEN email_verified_at ELSE NULL END
+        WHERE id = ? AND group_id = ?`).bind(email, email, email, participantId, context.groupId));
+    await db().batch(statements);
+  } catch (error) {
+    if (String(error).toLowerCase().includes("unique")) {
+      throw new Error("That email already belongs to another person in this group.");
+    }
+    throw error;
+  }
+  return email;
+}
+
+export async function sendGroupMemberReminder(request: Request, participantId: string) {
+  const context = await currentContext(request);
+  if (!context || context.role !== "admin") throw new Error("Only the group creator can send reminders.");
+  const participant = await db().prepare(`SELECT p.id, p.display_name, p.email, p.is_creator,
+      EXISTS(SELECT 1 FROM calendar_connections c WHERE c.participant_id = p.id) AS has_calendar
+      FROM participants p WHERE p.id = ? AND p.group_id = ? LIMIT 1`)
+    .bind(participantId, context.groupId).first<Record<string, unknown>>();
+  if (!participant) throw new Error("That person is no longer in this group.");
+  if (Number(participant.is_creator) === 1) throw new Error("The creator does not need a participant reminder.");
+  if (!participant.email) throw new Error("Add this participant’s email before sending a reminder.");
+  if (Number(participant.has_calendar) === 1) throw new Error("This participant already connected a calendar.");
+
+  const dayMs = 24 * 60 * 60 * 1000;
+  let rate: { counts: number[]; windowStart: number };
+  try {
+    rate = await incrementRateCounters([
+      { key: `reminder:participant:${context.groupId}:${participantId}`, limit: 3 },
+      { key: `reminder:group:${context.groupId}`, limit: 50 },
+      { key: "reminder:deployment", limit: 500 },
+    ], dayMs);
+  } catch {
+    throw new Error("Too many reminders were sent. Please try again tomorrow.");
+  }
+  const groupUrl = `${new URL(request.url).origin}/?group=${encodeURIComponent(context.slug)}`;
+  await sendCalendarReminderEmail({
+    email: String(participant.email), participantName: String(participant.display_name),
+    creatorName: context.displayName, groupName: context.groupName, groupUrl,
+    idempotencyKey: await sha256(`calendar-reminder:${context.groupId}:${participantId}:${rate.windowStart}:${rate.counts[0]}`),
+  });
 }
 
 async function mergeParticipantInto(groupId: string, sourceId: string, targetId: string) {

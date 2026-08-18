@@ -13,10 +13,12 @@ Overlap is a privacy-first group availability portal for Google Calendar and Mic
 - Creates private groups without global app accounts
 - Uses a group name, password, and one-time email code for members
 - Gives the creator a separate recovery key and settings access
+- Lets the creator attach emails to unverified participants and send calendar-connection reminders
 - Connects Google Calendar and Microsoft Outlook with read-only calendar scopes
 - Supports direct, self-service OAuth for Google Calendar and Microsoft Outlook
 - Optionally supports an admin-provisioned [MarimerLLC/calendar-mcp](https://github.com/MarimerLLC/calendar-mcp) HTTP server
 - Shows only the shared free times; event titles and descriptions are never stored
+- Keeps showing results from connected calendars while naming participants whose availability is not yet included
 - Calculates 30-minute through 5-hour openings across six months
 
 ## Product flow
@@ -68,6 +70,8 @@ EMAIL_FROM="Overlap <verify@YOUR_HOST>"
 ```
 
 Codes expire after ten minutes, are stored only as hashes, are single-use, allow at most five atomic attempts, and are rate-limited per purpose and email address, requester IP, and deployment. Existing deployments can let legacy participants verify the profile they already use, including on the original deployment URL, before reopening it on a custom domain.
+
+Creators can add an email to a participant who has not verified one yet. This reserves that existing participant profile for the address, so joining and verifying it reopens the same calendar connections instead of creating a duplicate. A creator cannot replace a verified participant’s address. Calendar reminder emails contain the group link but never the group password, are limited per participant, group, and deployment, and stop once that participant has connected a calendar.
 
 ## How calendar connections work in an open-source deployment
 
@@ -186,7 +190,7 @@ The web app is React 19 on Vinext and Cloudflare Workers. D1 stores groups, pass
 
 ## Stored data and deletion
 
-D1 stores group metadata, verified participant email addresses, hashed passwords and recovery keys, hashed short-lived verification/session/OAuth state, and encrypted provider refresh tokens. Resend receives the recipient address, group name, and one-time code needed to deliver verification email. Busy intervals are fetched when availability is requested and are not persisted.
+D1 stores group metadata, participant email addresses, hashed passwords and recovery keys, hashed short-lived verification/session/OAuth state, and encrypted provider refresh tokens. Resend receives the recipient address and the minimum message content needed for verification or a creator-requested calendar reminder, including the relevant participant, creator, and group names. Busy intervals are fetched when availability is requested and are not persisted.
 
 The group creator can remove any non-creator participant, which deletes that participant’s Overlap profile, local sessions, pending OAuth state, and stored calendar connections. A member can leave a group and remove the same local data while keeping sessions for their other groups. Removing an Overlap connection does not revoke the grant at Google or Microsoft; the calendar owner can revoke that grant in their provider account. Group deletion and creator transfer are not yet implemented, so a self-hosting operator must handle full-group deletion directly in D1 if required.
 

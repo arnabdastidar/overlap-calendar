@@ -2,7 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
-type Member = { id: string; displayName: string; color: string; provider: string | null; calendarName: string | null; isDemo: boolean; emailVerified: boolean; isCreator: boolean };
+type Member = { id: string; displayName: string; color: string; provider: string | null; calendarName: string | null; isDemo: boolean; email: string | null; emailVerified: boolean; isCreator: boolean };
 type GroupAccess = { groupName: string; slug: string; role: "admin" | "member"; participantId: string };
 type Group = {
   groupName: string; slug: string; displayName: string; role: "admin" | "member";
@@ -144,6 +144,9 @@ export default function Home() {
   }, [calendarConfig, group]);
 
   const connectedCount = uniqueMembers.filter((member) => member.providers.length).length;
+  const missingMembers = uniqueMembers.filter((member) => !member.providers.length);
+  const missingMemberNames = new Intl.ListFormat("en", { style: "long", type: "conjunction" })
+    .format(missingMembers.map((member) => member.displayName));
   const connectedProviders = uniqueMembers.find((member) => member.id === group?.participantId)?.providers ?? [];
   const groupedSlots = useMemo(() => {
     const result = new Map<string, Slot[]>();
@@ -302,6 +305,17 @@ export default function Home() {
     }
   }
 
+  async function saveMemberEmail(member: Member, email: string) {
+    await jsonRequest(`/api/groups/members/${encodeURIComponent(member.id)}`, "PUT", { email });
+    await loadGroup(group?.slug);
+    showToast(`Email saved for ${member.displayName}`);
+  }
+
+  async function sendMemberReminder(member: Member) {
+    await jsonRequest(`/api/groups/members/${encodeURIComponent(member.id)}`, "POST");
+    showToast(`Reminder sent to ${member.displayName}`);
+  }
+
   async function copy(value: string, message: string) {
     await navigator.clipboard.writeText(value);
     showToast(message);
@@ -388,9 +402,10 @@ export default function Home() {
 
         <section className="availability-card">
           <div className="card-heading">
-            <div><h2>When can everyone meet?</h2><p>Shared openings appear only after every person has connected a calendar.</p></div>
+            <div><h2>When can everyone meet?</h2><p>Openings reflect the calendars currently connected to this overlap.</p></div>
             <div className="timezone"><span>◉</span><div><small>TIME ZONE</small><strong>{timezone.replace("_", " ")}</strong></div></div>
           </div>
+          {missingMembers.length > 0 && connectedCount > 0 && <div className="availability-warning"><span>!</span><div><strong>{missingMembers.length === 1 ? `${missingMemberNames}’s availability is not yet accounted for.` : `${missingMemberNames}’s availabilities are not yet accounted for.`}</strong><small>These openings use connected calendars only. Ask {missingMembers.length === 1 ? "them" : "these participants"} to connect.</small></div><button type="button" onClick={() => setModal("people")}>{group.role === "admin" ? "Add email or send reminder" : "View people"}</button></div>}
           <div className="filters">
             <label><span>MEETING LENGTH</span><select value={duration} onChange={(event) => setDuration(Number(event.target.value))}>{durations.map((value) => <option value={value} key={value}>{durationLabel(value)}</option>)}</select></label>
             <label><span>LOOKING AHEAD</span><select value={days} onChange={(event) => setDays(Number(event.target.value))}>{[30, 60, 90, 180].map((value) => <option value={value} key={value}>{value === 180 ? "6 months" : `${value} days`}</option>)}</select></label>
@@ -398,11 +413,11 @@ export default function Home() {
             <button className="find-button" type="button" onClick={() => findTimes()} disabled={finding}><span className={finding ? "spin" : ""}>↻</span> {finding ? "Checking…" : "Find times"}</button>
           </div>
 
-          {connectedCount < uniqueMembers.length ? (
-            <div className="empty-state"><span className="empty-mark">◷</span><h3>{connectedCount ? `Waiting for ${uniqueMembers.length - connectedCount} ${uniqueMembers.length - connectedCount === 1 ? "person" : "people"}` : "Connect the first calendar"}</h3><p>To avoid misleading results, Overlap waits until everyone has connected before calculating shared availability.</p>{!connectedProviders.length && <button onClick={() => setModal("connect")}>Connect your calendar <span>→</span></button>}</div>
+          {connectedCount === 0 ? (
+            <div className="empty-state"><span className="empty-mark">◷</span><h3>Connect the first calendar</h3><p>At least one calendar is needed before Overlap can calculate availability.</p>{!connectedProviders.length && <button onClick={() => setModal("connect")}>Connect your calendar <span>→</span></button>}</div>
           ) : (
             <>
-              <div className="results-head"><p><span className="pulse" /> <strong>{slots.length} openings</strong> in the next {days === 180 ? "6 months" : `${days} days`}{source === "mcp" && <small className="source-tag"> via MCP</small>}</p></div>
+              <div className="results-head"><p><span className="pulse" /> <strong>{slots.length} openings</strong> based on {connectedCount} of {uniqueMembers.length} {uniqueMembers.length === 1 ? "person" : "people"} in the next {days === 180 ? "6 months" : `${days} days`}{source === "mcp" && <small className="source-tag"> via MCP</small>}</p></div>
               <div className="slot-grid">
                 {groupedSlots.length ? groupedSlots.map(([day, daySlots]) => {
                   const [weekday, month, date] = day.replace(",", "").split(" ");
@@ -428,7 +443,7 @@ export default function Home() {
       {modal === "connect" && <ConnectModal config={calendarConfig} connectedProviders={connectedProviders} error={formError} onClose={() => { setModal(null); setFormError(""); }} onConnect={connect} onConnectMcp={connectMcp} />}
       {modal === "share" && <ShareModal group={group} shareUrl={shareUrl} recoveryKey={recoveryKey} onCopy={copy} onClose={() => setModal(null)} />}
       {modal === "settings" && <SettingsModal group={group} error={formError} recoveryKey={recoveryKey} onClose={() => { setModal(null); setFormError(""); }} onSubmit={updateSettings} onGenerateRecoveryKey={generateRecoveryKey} />}
-      {modal === "people" && <PeopleModal members={uniqueMembers} currentParticipantId={group.participantId} canManage={group.role === "admin"} onRemove={removeMember} onClose={() => setModal(null)} />}
+      {modal === "people" && <PeopleModal members={uniqueMembers} currentParticipantId={group.participantId} canManage={group.role === "admin"} onRemove={removeMember} onSaveEmail={saveMemberEmail} onSendReminder={sendMemberReminder} onClose={() => setModal(null)} />}
       {modal === "verifyEmail" && <ProfileEmailModal email={group.email ?? ""} error={formError} onClose={() => { setModal(null); setFormError(""); }} onSubmit={verifyProfileEmail} onRequestCode={async (email) => {
         setFormError("");
         try {
@@ -535,8 +550,28 @@ function SettingsModal({ group, error, recoveryKey, onClose, onSubmit, onGenerat
   return <ModalShell onClose={onClose}><span className="modal-kicker">CREATOR SETTINGS</span><h2>Group settings</h2><p>Leave a field blank to keep its current value.</p><form onSubmit={onSubmit}><label><span>GROUP NAME</span><input name="name" defaultValue={group.groupName} /></label><label><span>NEW PASSWORD</span><input name="password" type="password" minLength={6} placeholder="At least 6 characters" /></label>{error && <div className="form-error">{error}</div>}<button className="modal-primary" type="submit">Save changes <span>→</span></button></form><div className="recovery-settings"><strong>Creator recovery</strong><p>The recovery key is different from the group password. Generating a new key disables the previous one.</p>{recoveryKey ? <label className="copy-field"><span>RECOVERY KEY</span><div><input value={recoveryKey} readOnly /><button onClick={() => navigator.clipboard.writeText(recoveryKey)}>Copy</button></div></label> : <button className="secondary-button" type="button" onClick={onGenerateRecoveryKey}>Generate a new recovery key</button>}</div></ModalShell>;
 }
 
-function PeopleModal({ members, currentParticipantId, canManage, onRemove, onClose }: { members: Array<Member & { providers: string[] }>; currentParticipantId: string; canManage: boolean; onRemove: (member: Member) => void; onClose: () => void }) {
-  return <ModalShell onClose={onClose}><span className="modal-kicker">GROUP MEMBERS</span><h2>People in this overlap</h2><p>{canManage ? "As the creator, you can remove duplicate or former members." : "Only the group creator can remove people."}</p><div className="people-list">{members.map((member) => <div key={member.id}><span className={`avatar ${member.color}`}>{initials(member.displayName)}</span><p><strong>{member.displayName}{member.id === currentParticipantId ? " (you)" : ""}{member.isCreator ? " · Creator" : ""}</strong><small>{member.providers.length ? member.providers.map((item) => item === "google" ? "Google" : item === "microsoft" ? "Microsoft" : "MCP").join(" + ") : "Calendar not connected"} · {member.emailVerified ? "Email verified" : "Email not verified"}</small></p><b className={member.providers.length ? "ready" : ""}>{member.providers.length ? "Ready" : "Waiting"}</b>{canManage && member.id !== currentParticipantId && !member.isCreator && <button className="remove-member" type="button" onClick={() => onRemove(member)}>Remove</button>}</div>)}</div></ModalShell>;
+function PeopleModal({ members, currentParticipantId, canManage, onRemove, onSaveEmail, onSendReminder, onClose }: { members: Array<Member & { providers: string[] }>; currentParticipantId: string; canManage: boolean; onRemove: (member: Member) => void; onSaveEmail: (member: Member, email: string) => Promise<void>; onSendReminder: (member: Member) => Promise<void>; onClose: () => void }) {
+  return <ModalShell onClose={onClose} className="people-modal"><span className="modal-kicker">GROUP MEMBERS</span><h2>People in this overlap</h2><p>{canManage ? "Add participant emails, remind people to connect a calendar, or remove former members." : "Only the group creator can manage participant invitations."}</p><div className="people-list">{members.map((member) => <div className="people-row" key={member.id}><div className="people-summary"><span className={`avatar ${member.color}`}>{initials(member.displayName)}</span><p><strong>{member.displayName}{member.id === currentParticipantId ? " (you)" : ""}{member.isCreator ? " · Creator" : ""}</strong><small>{member.providers.length ? member.providers.map((item) => item === "google" ? "Google" : item === "microsoft" ? "Microsoft" : "MCP").join(" + ") : "Calendar not connected"} · {member.emailVerified ? "Email verified" : member.email ? "Email added · awaiting verification" : "Email not added"}</small></p><b className={member.providers.length ? "ready" : ""}>{member.providers.length ? "Ready" : "Waiting"}</b>{canManage && member.id !== currentParticipantId && !member.isCreator && <button className="remove-member" type="button" onClick={() => onRemove(member)}>Remove</button>}</div>{canManage && !member.isCreator && <MemberEmailControls key={`${member.id}:${member.email}`} member={member} onSave={onSaveEmail} onSendReminder={onSendReminder} />}</div>)}</div></ModalShell>;
+}
+
+function MemberEmailControls({ member, onSave, onSendReminder }: { member: Member & { providers: string[] }; onSave: (member: Member, email: string) => Promise<void>; onSendReminder: (member: Member) => Promise<void> }) {
+  const [email, setEmail] = useState(member.email ?? "");
+  const [busy, setBusy] = useState<"save" | "send" | null>(null);
+  const [error, setError] = useState("");
+  async function act(kind: "save" | "send") {
+    setBusy(kind);
+    setError("");
+    try {
+      if (kind === "save") await onSave(member, email);
+      else await onSendReminder(member);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not update this participant.");
+    } finally {
+      setBusy(null);
+    }
+  }
+  const emailChanged = email.trim().toLowerCase() !== (member.email ?? "").toLowerCase();
+  return <div className="member-email-controls"><input aria-label={`Email for ${member.displayName}`} type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="participant@example.com" readOnly={member.emailVerified} /><button type="button" disabled={busy !== null || !email.trim() || (!emailChanged && Boolean(member.email)) || member.emailVerified} onClick={() => act("save")}>{busy === "save" ? "Saving…" : member.email ? "Update email" : "Save email"}</button>{member.email && !member.providers.length && <button className="reminder-button" type="button" disabled={busy !== null || emailChanged} onClick={() => act("send")}>{busy === "send" ? "Sending…" : "Send reminder"}</button>}{error && <small className="member-email-error">{error}</small>}</div>;
 }
 
 function GroupSwitcher({ groups, activeSlug, canLeave, onSwitch, onCreate, onJoin, onRecover, onLeave, onClose }: { groups: GroupAccess[]; activeSlug: string; canLeave: boolean; onSwitch: (slug: string) => void; onCreate: () => void; onJoin: () => void; onRecover: () => void; onLeave: () => void; onClose: () => void }) {

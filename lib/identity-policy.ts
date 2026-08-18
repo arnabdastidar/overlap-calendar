@@ -19,3 +19,7 @@ export function preferSourceConnection(source: MergeableConnection, target: Merg
   const targetQuality = connectionQuality(target);
   return sourceQuality > targetQuality || (sourceQuality === targetQuality && source.createdAt > target.createdAt);
 }
+
+export function canAssignMemberEmail(currentEmail: string | null, emailVerifiedAt: number | null, nextEmail: string) {
+  return !emailVerifiedAt || currentEmail === nextEmail;
+}

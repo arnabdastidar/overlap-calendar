@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { preferSourceConnection } from "../lib/identity-policy";
+import { canAssignMemberEmail, preferSourceConnection } from "../lib/identity-policy";
 import { consumeVerificationSql, incrementVerificationAttemptSql, incrementVerificationRateSql } from "../lib/verification-queries";
 
 function verificationDatabase() {
@@ -52,6 +52,13 @@ test("profile merge keeps a usable or fresher calendar credential", () => {
   assert.equal(preferSourceConnection(validOauth, staleDemo), true);
   assert.equal(preferSourceConnection(staleDemo, validOauth), false);
   assert.equal(preferSourceConnection({ ...validOauth, createdAt: 30 }, validOauth), true);
+});
+
+test("a creator cannot replace a participant email after that participant verifies it", () => {
+  assert.equal(canAssignMemberEmail(null, null, "person@example.com"), true);
+  assert.equal(canAssignMemberEmail("person@example.com", null, "new@example.com"), true);
+  assert.equal(canAssignMemberEmail("person@example.com", Date.now(), "person@example.com"), true);
+  assert.equal(canAssignMemberEmail("person@example.com", Date.now(), "attacker@example.com"), false);
 });
 
 test("the committed legacy migration upgrades participants and enforces one email per group", async () => {

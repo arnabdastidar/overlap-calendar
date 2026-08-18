@@ -66,16 +66,13 @@ export async function findGroupAvailability(groupId: string, duration: number, d
   });
   const connectedParticipantIds = new Set(connections.map((connection) => connection.participantId));
   const pendingParticipantCount = participantIds.filter((participantId) => !connectedParticipantIds.has(participantId)).length;
-  if (pendingParticipantCount) {
-    return { slots: [], connectionCount: connections.length, participantCount: participantIds.length, pendingParticipantCount, source: "waiting" };
-  }
-  if (!connections.length) return { slots: [], connectionCount: 0, participantCount: participantIds.length, pendingParticipantCount: 0, source: "none" };
+  if (!connections.length) return { slots: [], connectionCount: 0, participantCount: participantIds.length, pendingParticipantCount, source: "none" };
   const start = new Date();
   const end = new Date(start.getTime() + days * 24 * 60 * 60 * 1000);
   const mcpConnections = connections.filter((connection) => connection.provider === "mcp");
   if (mcpConnections.length === connections.length && appEnv.CALENDAR_MCP_URL) {
     const slots = await findTimesWithMcp(mcpConnections.map((item) => item.accountRef), duration, start.toISOString(), end.toISOString());
-    return { slots: slots.slice(0, 40), connectionCount: connections.length, participantCount: participantIds.length, pendingParticipantCount: 0, source: "mcp" };
+    return { slots: slots.slice(0, 40), connectionCount: connections.length, participantCount: participantIds.length, pendingParticipantCount, source: "mcp" };
   }
   if (mcpConnections.length) {
     throw new Error("This group mixes direct OAuth and Calendar MCP connections. Use one connection mode for everyone in the group.");
@@ -112,5 +109,5 @@ export async function findGroupAvailability(groupId: string, duration: number, d
       slots.push({ start: new Date(startMs).toISOString(), end: new Date(endMs).toISOString() });
     }
   }
-  return { slots, connectionCount: connections.length, participantCount: participantIds.length, pendingParticipantCount: 0, source: connections.every(isDemoConnection) ? "demo" : "provider" };
+  return { slots, connectionCount: connections.length, participantCount: participantIds.length, pendingParticipantCount, source: connections.every(isDemoConnection) ? "demo" : "provider" };
 }
