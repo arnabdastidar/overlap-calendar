@@ -144,6 +144,8 @@ export default function Home() {
   }, [calendarConfig, group]);
 
   const connectedCount = uniqueMembers.filter((member) => member.providers.length).length;
+  const connectedMemberNames = new Intl.ListFormat("en", { style: "long", type: "conjunction" })
+    .format(uniqueMembers.filter((member) => member.providers.length).map((member) => member.displayName));
   const missingMembers = uniqueMembers.filter((member) => !member.providers.length);
   const missingMemberNames = new Intl.ListFormat("en", { style: "long", type: "conjunction" })
     .format(missingMembers.map((member) => member.displayName));
@@ -405,7 +407,7 @@ export default function Home() {
             <div><h2>When can everyone meet?</h2><p>Openings reflect the calendars currently connected to this overlap.</p></div>
             <div className="timezone"><span>◉</span><div><small>TIME ZONE</small><strong>{timezone.replace("_", " ")}</strong></div></div>
           </div>
-          {missingMembers.length > 0 && connectedCount > 0 && <div className="availability-warning"><span>!</span><div><strong>{missingMembers.length === 1 ? `${missingMemberNames}’s availability is not yet accounted for.` : `${missingMemberNames}’s availabilities are not yet accounted for.`}</strong><small>These openings use connected calendars only. Ask {missingMembers.length === 1 ? "them" : "these participants"} to connect.</small></div><button type="button" onClick={() => setModal("people")}>{group.role === "admin" ? "Add email or send reminder" : "View people"}</button></div>}
+          {missingMembers.length > 0 && connectedCount > 0 && <div className="availability-warning" role="status"><span className="availability-warning-icon" aria-hidden="true">!</span><div className="availability-warning-copy"><strong>{missingMembers.length === 1 ? `${missingMemberNames}’s availability is not yet accounted for` : `${missingMemberNames}’s availabilities are not yet accounted for`}</strong><small>These openings use {connectedCount === 1 ? "1 connected calendar" : `${connectedCount} connected calendars`} only. Ask {missingMembers.length === 1 ? "them" : "these participants"} to connect.</small></div><button type="button" onClick={() => setModal("people")}>{group.role === "admin" ? "Manage people" : "View people"}<span aria-hidden="true">→</span></button></div>}
           <div className="filters">
             <label><span>MEETING LENGTH</span><select value={duration} onChange={(event) => setDuration(Number(event.target.value))}>{durations.map((value) => <option value={value} key={value}>{durationLabel(value)}</option>)}</select></label>
             <label><span>LOOKING AHEAD</span><select value={days} onChange={(event) => setDays(Number(event.target.value))}>{[30, 60, 90, 180].map((value) => <option value={value} key={value}>{value === 180 ? "6 months" : `${value} days`}</option>)}</select></label>
@@ -417,7 +419,7 @@ export default function Home() {
             <div className="empty-state"><span className="empty-mark">◷</span><h3>Connect the first calendar</h3><p>At least one calendar is needed before Overlap can calculate availability.</p>{!connectedProviders.length && <button onClick={() => setModal("connect")}>Connect your calendar <span>→</span></button>}</div>
           ) : (
             <>
-              <div className="results-head"><p><span className="pulse" /> <strong>{slots.length} openings</strong> based on {connectedCount} of {uniqueMembers.length} {uniqueMembers.length === 1 ? "person" : "people"} in the next {days === 180 ? "6 months" : `${days} days`}{source === "mcp" && <small className="source-tag"> via MCP</small>}</p></div>
+              <div className="results-head"><p><span className="pulse" /> <strong>{slots.length} openings</strong> based on the availability of <strong>{connectedMemberNames}</strong> over the next {days === 180 ? "6 months" : `${days} days`}{source === "mcp" && <small className="source-tag"> via MCP</small>}</p></div>
               <div className="slot-grid">
                 {groupedSlots.length ? groupedSlots.map(([day, daySlots]) => {
                   const [weekday, month, date] = day.replace(",", "").split(" ");

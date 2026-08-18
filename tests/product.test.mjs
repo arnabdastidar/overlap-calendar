@@ -169,7 +169,8 @@ test("partial availability names missing participants and calendars can be recon
   assert.doesNotMatch(availability, /if \(pendingParticipantCount\)/);
   assert.match(page, /availability is not yet accounted for/);
   assert.match(page, /availabilities are not yet accounted for/);
-  assert.match(page, /based on \{connectedCount\} of \{uniqueMembers\.length\}/);
+  assert.match(page, /based on the availability of/);
+  assert.match(page, /connectedMemberNames/);
   assert.doesNotMatch(page, /disabled=\{!googleAvailable \|\| googleConnected\}/);
   assert.doesNotMatch(page, /disabled=\{!microsoftAvailable \|\| microsoftConnected\}/);
 });
